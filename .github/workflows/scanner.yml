@@ -3,8 +3,16 @@ name: 급등주 시그널 스캔
 on:
   workflow_dispatch:            # GitHub Actions 탭에서 "Run workflow" 버튼으로 수동 실행
     inputs:
+      universe:
+        description: "전체 스캔 대상 (all: 실시간 전체 보통주 / list: TICKERS 고정 리스트)"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - list
       codes:
-        description: "조회할 종목 (예: AAPL TSLA 또는 AAPL,TSLA). 비우면 전체 스캔"
+        description: "조회할 종목 (예: AAPL TSLA 또는 AAPL,TSLA). 입력하면 위 선택 대신 이 종목만 조회"
         required: false
         default: ""
 
@@ -32,9 +40,12 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CODES: ${{ inputs.codes }}
+          UNIVERSE: ${{ inputs.universe }}
         run: |
           if [ -n "$CODES" ]; then
             python scanner.py --codes $CODES
+          elif [ "$UNIVERSE" = "list" ]; then
+            python scanner.py --list
           else
             python scanner.py
           fi

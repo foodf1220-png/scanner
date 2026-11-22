@@ -17,7 +17,9 @@ scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
   운용   계좌 5칸 (칸마다 계좌의 1/5), 칸이 비면 다음 신호에 다시 사용
 
 [실행] 모든 실행은 결과와 상관없이 텔레그램 메시지가 최소 1개 감 (오류가 나면 오류 내용)
-  python scanner.py                        전체 스캔: 가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
+  python scanner.py                        전체 스캔: 실시간 전체 보통주(NASDAQ 공식 목록, 약 4천 개) 중
+                                           가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
+  python scanner.py --list                 전체 스캔을 아래 TICKERS 고정 리스트로
   python scanner.py --codes AAPL TSLA      종목 조회: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록
   python scanner.py --paper                실시간 모의투자 봇 (한국 21:00 이후 실행, 모의투자_시작.bat)
   python scanner.py --test-alert           알림 테스트
@@ -69,6 +71,109 @@ CFG = dict(
     capital=10000.0,          # 모의투자 계좌 금액 ($)
     lag_min=1,                # 야후 분봉 지연 여유 (분)
 )
+
+# 고정 종목 리스트: python scanner.py --list 로 전체 스캔할 때 사용 (기본은 실시간 전체 목록)
+TICKERS = [
+    'A', 'AA', 'AAMI', 'AAOI', 'AAON', 'AAPL', 'ABBV', 'ABCB', 'ABG', 'ABNB', 'ABT', 'ACA', 'ACGL',
+    'ACHC', 'ACIW', 'ACLS', 'ACM', 'ACMR', 'ADBE', 'ADC', 'ADI', 'ADM', 'ADP', 'ADSK', 'ADUS', 'AEE',
+    'AEHR', 'AEIS', 'AEM', 'AEP', 'AFG', 'AFL', 'AFRM', 'AGCO', 'AGIO', 'AGL', 'AGM', 'AGO', 'AGX',
+    'AGYS', 'AHR', 'AIG', 'AIN', 'AIR', 'AIT', 'AIZ', 'AJG', 'AKAM', 'ALAB', 'ALB', 'ALG', 'ALGM',
+    'ALGN', 'ALGT', 'ALK', 'ALL', 'ALLY', 'ALNT', 'ALNY', 'ALRM', 'ALSN', 'ALV', 'AMAT', 'AMBQ', 'AMD',
+    'AMG', 'AMGN', 'AMKR', 'AMP', 'AMR', 'AMSC', 'AMT', 'AMZN', 'AN', 'ANAB', 'ANDE', 'ANET', 'ANF',
+    'AOS', 'APA', 'APAM', 'APD', 'APG', 'APGE', 'APH', 'APO', 'APP', 'APPF', 'AR', 'ARCB', 'ARE',
+    'ARES', 'ARMK', 'AROC', 'ARW', 'ARWR', 'ARXS', 'ASB', 'ASH', 'ASO', 'ASTH', 'ASTS', 'ATEX', 'ATI',
+    'ATKR', 'ATMU', 'ATO', 'ATR', 'ATRC', 'ATRO', 'AUB', 'AVA', 'AVAV', 'AVB', 'AVGO', 'AVNT', 'AVT',
+    'AVY', 'AWI', 'AWK', 'AWR', 'AX', 'AXGN', 'AXON', 'AXP', 'AXS', 'AXSM', 'AXTI', 'AYI', 'AZO',
+    'BA', 'BAC', 'BAH', 'BALL', 'BAND', 'BANR', 'BAP', 'BATRK', 'BBIO', 'BBY', 'BC', 'BCC', 'BCO',
+    'BCPC', 'BDC', 'BDX', 'BE', 'BELFA', 'BELFB', 'BEN', 'BFAM', 'BFH', 'BH', 'BHE', 'BHF', 'BIIB',
+    'BILL', 'BIO', 'BJ', 'BJRI', 'BKH', 'BKNG', 'BKR', 'BKU', 'BL', 'BLBD', 'BLDR', 'BLFS', 'BLK',
+    'BLKB', 'BLLN', 'BMI', 'BMO', 'BMRN', 'BMY', 'BNY', 'BOH', 'BOKF', 'BOOT', 'BOX', 'BP', 'BPOP',
+    'BR', 'BRKR', 'BRO', 'BROS', 'BSX', 'BSY', 'BTI', 'BTSG', 'BURL', 'BUSE', 'BWA', 'BWXT', 'BX',
+    'BXP', 'BYD', 'BZH', 'C', 'CACC', 'CACI', 'CAH', 'CAKE', 'CALM', 'CALX', 'CAR', 'CARG', 'CARR',
+    'CART', 'CASY', 'CAT', 'CATY', 'CAVA', 'CB', 'CBC', 'CBRE', 'CBRL', 'CBRS', 'CBSH', 'CBT', 'CBZ',
+    'CCI', 'CCJ', 'CDNA', 'CDNL', 'CDNS', 'CDW', 'CE', 'CECO', 'CEG', 'CELC', 'CENX', 'CEVA', 'CF',
+    'CFG', 'CFR', 'CG', 'CGNX', 'CHD', 'CHDN', 'CHEF', 'CHH', 'CHRD', 'CHRW', 'CHTR', 'CI', 'CIEN',
+    'CINF', 'CL', 'CLH', 'CLMT', 'CLS', 'CLX', 'CM', 'CMC', 'CME', 'CMG', 'CMI', 'CMS', 'CNA',
+    'CNC', 'CNI', 'CNK', 'CNM', 'CNMD', 'CNO', 'CNP', 'CNQ', 'CNR', 'CNX', 'COCO', 'COF', 'COGT',
+    'COHR', 'COHU', 'COIN', 'COKE', 'COLB', 'COLM', 'CON', 'COO', 'COP', 'COR', 'CORT', 'COST', 'CPA',
+    'CPAY', 'CPK', 'CPT', 'CR', 'CRAI', 'CRBG', 'CRC', 'CRCL', 'CRI', 'CRL', 'CRM', 'CRNX', 'CROX',
+    'CRS', 'CRUS', 'CRWD', 'CRWV', 'CSCO', 'CSL', 'CSW', 'CSX', 'CTAS', 'CTRE', 'CTSH', 'CTVA', 'CUBI',
+    'CURB', 'CVCO', 'CVI', 'CVLT', 'CVNA', 'CVS', 'CVX', 'CW', 'CWEN', 'CWST', 'CWT', 'CXT', 'CXW',
+    'CYTK', 'D', 'DAL', 'DAR', 'DASH', 'DAVE', 'DB', 'DBX', 'DCI', 'DCO', 'DD', 'DDOG', 'DDS',
+    'DE', 'DECK', 'DELL', 'DEO', 'DFNS', 'DG', 'DGII', 'DGX', 'DHI', 'DHR', 'DINO', 'DIOD', 'DIS',
+    'DJCO', 'DK', 'DKS', 'DLB', 'DLR', 'DLTR', 'DNTH', 'DOCN', 'DOCU', 'DORM', 'DOV', 'DOW', 'DPZ',
+    'DRI', 'DRS', 'DSGX', 'DT', 'DTE', 'DTM', 'DUK', 'DUOL', 'DVA', 'DVN', 'DXCM', 'DXPE', 'DY',
+    'EAT', 'EBAY', 'ECG', 'ECHO', 'ECL', 'ECO', 'ECPG', 'ED', 'EEFT', 'EFX', 'EG', 'EGP', 'EHC',
+    'EIX', 'EL', 'ELF', 'ELS', 'ELV', 'ELVN', 'EMBJ', 'EME', 'EMN', 'EMR', 'ENB', 'ENPH', 'ENS',
+    'ENSG', 'ENTG', 'ENVA', 'EOG', 'EPAM', 'EPD', 'EPR', 'EPRT', 'EQH', 'EQIX', 'EQT', 'ERIE', 'ES',
+    'ESAB', 'ESE', 'ESI', 'ESS', 'ETON', 'ETR', 'ETSY', 'EVR', 'EVRG', 'EW', 'EWBC', 'EWTX', 'EXC',
+    'EXE', 'EXEL', 'EXLS', 'EXP', 'EXPD', 'EXPE', 'EXPO', 'EXR', 'FAF', 'FANG', 'FAST', 'FBIN', 'FBRX',
+    'FCFS', 'FCN', 'FCNCA', 'FCX', 'FDS', 'FDX', 'FDXF', 'FE', 'FEIM', 'FELE', 'FERG', 'FFBC', 'FFIN',
+    'FFIV', 'FHI', 'FIBK', 'FICO', 'FIS', 'FISV', 'FITB', 'FIVE', 'FIX', 'FLR', 'FLS', 'FMX', 'FND',
+    'FNF', 'FORM', 'FOUR', 'FOX', 'FOXA', 'FPS', 'FR', 'FRPT', 'FRT', 'FSLR', 'FSS', 'FTAI', 'FTDR',
+    'FTNT', 'FTV', 'FUL', 'FWONK', 'G', 'GATX', 'GBCI', 'GD', 'GDDY', 'GE', 'GEF', 'GEHC', 'GEV',
+    'GFF', 'GGG', 'GH', 'GHC', 'GIB', 'GIL', 'GILD', 'GIS', 'GKOS', 'GL', 'GLPI', 'GLW', 'GM',
+    'GMED', 'GNRC', 'GOLF', 'GOOGL', 'GPC', 'GPI', 'GPN', 'GRAL', 'GRMN', 'GS', 'GSAT', 'GSHD', 'GTLB',
+    'GVA', 'GWRE', 'GWW', 'GXO', 'H', 'HAE', 'HAL', 'HALO', 'HAS', 'HASI', 'HCA', 'HCC', 'HCI',
+    'HD', 'HEI', 'HGV', 'HHH', 'HIG', 'HII', 'HIW', 'HLI', 'HLIO', 'HLNE', 'HLT', 'HMC', 'HNGE',
+    'HNI', 'HOMB', 'HON', 'HONA', 'HOOD', 'HP', 'HPE', 'HQY', 'HRB', 'HRI', 'HRMY', 'HROW', 'HSBC',
+    'HSIC', 'HSY', 'HTO', 'HUBB', 'HUBG', 'HUBS', 'HUM', 'HURN', 'HUT', 'HWC', 'HWKN', 'HWM', 'HXL',
+    'HZO', 'IBKR', 'IBM', 'IBOC', 'IBP', 'ICE', 'ICUI', 'IDA', 'IDCC', 'IDXX', 'IDYA', 'IESC', 'IEX',
+    'IFF', 'ILMN', 'IMAX', 'IMO', 'IMVT', 'INCY', 'INDB', 'INDV', 'ING', 'INGR', 'INOD', 'INSM', 'INSP',
+    'INSW', 'INTA', 'INTC', 'INTU', 'INVH', 'IOND', 'IONQ', 'IONS', 'IOT', 'IP', 'IPAR', 'IPGP', 'IQV',
+    'IR', 'IRDM', 'IRM', 'IRON', 'IRTC', 'ISRG', 'IT', 'ITGR', 'ITRI', 'ITT', 'ITW', 'IVT', 'IVZ',
+    'J', 'JAN', 'JAZZ', 'JBHT', 'JBL', 'JBTM', 'JEF', 'JJSF', 'JKHY', 'JLL', 'JNJ', 'JPM', 'JXN',
+    'KAI', 'KALU', 'KBH', 'KBR', 'KDP', 'KEX', 'KEYS', 'KFY', 'KGS', 'KKR', 'KLAC', 'KLIC', 'KMB',
+    'KMI', 'KMT', 'KN', 'KNF', 'KNSL', 'KNTK', 'KO', 'KOD', 'KR', 'KRC', 'KRMN', 'KRYS', 'KTB',
+    'KTOS', 'KWR', 'KYMR', 'L', 'LAD', 'LAMR', 'LASR', 'LAUR', 'LAZ', 'LBRDK', 'LDOS', 'LEA', 'LEN',
+    'LEU', 'LFUS', 'LGND', 'LH', 'LHX', 'LIF', 'LII', 'LIND', 'LINE', 'LITE', 'LLY', 'LLYVK', 'LMAT',
+    'LMB', 'LMND', 'LMT', 'LNC', 'LNG', 'LNT', 'LNTH', 'LOAR', 'LOPE', 'LOW', 'LPG', 'LPLA', 'LPX',
+    'LQDA', 'LRCX', 'LRN', 'LSCC', 'LSTR', 'LTH', 'LTM', 'LULU', 'LUV', 'LVS', 'LW', 'LXP', 'LYV',
+    'MA', 'MAA', 'MAIN', 'MAIR', 'MAN', 'MANE', 'MANH', 'MAR', 'MAS', 'MATX', 'MBX', 'MC', 'MCD',
+    'MCHP', 'MCK', 'MCO', 'MCY', 'MDB', 'MDGL', 'MDLN', 'MDLZ', 'MEDP', 'MELI', 'MEOH', 'MET', 'META',
+    'MFC', 'MFP', 'MGA', 'MGM', 'MHK', 'MHO', 'MIAX', 'MIDD', 'MIRM', 'MKC', 'MKL', 'MKSI', 'MKTX',
+    'MLI', 'MLM', 'MMM', 'MMS', 'MMSI', 'MNPR', 'MOD', 'MOH', 'MORN', 'MP', 'MPC', 'MPTI', 'MPWR',
+    'MRCY', 'MRK', 'MRNA', 'MRSH', 'MRVL', 'MS', 'MSA', 'MSCI', 'MSFT', 'MSGE', 'MSGS', 'MSI', 'MSM',
+    'MSTR', 'MTB', 'MTCH', 'MTD', 'MTDR', 'MTG', 'MTH', 'MTN', 'MTSI', 'MTZ', 'MU', 'MUR', 'MUSA',
+    'MXL', 'MYRG', 'MZTI', 'NATL', 'NBIX', 'NDAQ', 'NDSN', 'NEE', 'NET', 'NEU', 'NFG', 'NFLX', 'NHC',
+    'NHI', 'NI', 'NIC', 'NJR', 'NKE', 'NKTR', 'NNN', 'NOC', 'NOVT', 'NOW', 'NP', 'NPO', 'NRG',
+    'NSC', 'NSIT', 'NSP', 'NTAP', 'NTCT', 'NTNX', 'NTRA', 'NTRS', 'NUE', 'NUTX', 'NVDA', 'NVEC', 'NVO',
+    'NVR', 'NVS', 'NWE', 'NWPX', 'NWS', 'NXPI', 'NXST', 'NXT', 'NYT', 'O', 'OC', 'ODFL', 'OGE',
+    'OGS', 'OHI', 'OII', 'OKE', 'OKTA', 'OLED', 'OLLI', 'OMC', 'OMCL', 'OMF', 'ON', 'ONTO', 'OPLN',
+    'ORA', 'ORCL', 'ORI', 'ORKA', 'ORLY', 'OSIS', 'OSK', 'OTIS', 'OUST', 'OUT', 'OXY', 'OZK', 'PAAS',
+    'PACS', 'PAG', 'PANW', 'PARR', 'PATK', 'PAY', 'PAYC', 'PAYX', 'PB', 'PBF', 'PBH', 'PCAR', 'PCOR',
+    'PCTY', 'PCVX', 'PDFS', 'PECO', 'PEG', 'PEGA', 'PEN', 'PENG', 'PEP', 'PFG', 'PFGC', 'PFSI', 'PG',
+    'PGR', 'PH', 'PHIN', 'PHM', 'PI', 'PII', 'PIPR', 'PJT', 'PKG', 'PLAB', 'PLD', 'PLNT', 'PLPC',
+    'PLTR', 'PLUS', 'PLXS', 'PM', 'PNC', 'PNW', 'PODD', 'POOL', 'POR', 'POST', 'POWI', 'POWL', 'PPG',
+    'PPL', 'PPLI', 'PRAX', 'PRDO', 'PRG', 'PRI', 'PRIM', 'PRK', 'PRKS', 'PRM', 'PRU', 'PSA', 'PSMT',
+    'PSN', 'PSX', 'PTC', 'PTCT', 'PTGX', 'PVH', 'PVLA', 'PWR', 'PYPL', 'Q', 'QCOM', 'QLYS', 'QNT',
+    'QRVO', 'QTWO', 'R', 'RAL', 'RAMP', 'RBA', 'RBC', 'RBLX', 'RBRK', 'RCI', 'RCL', 'RDDT', 'RDN',
+    'RDNT', 'REG', 'REGN', 'REXR', 'RF', 'RGA', 'RGEN', 'RGLD', 'RH', 'RHI', 'RIO', 'RJF', 'RKLB',
+    'RL', 'RLI', 'RMBS', 'RMD', 'RNG', 'RNR', 'RNST', 'ROAD', 'ROG', 'ROK', 'ROKU', 'ROL', 'ROP',
+    'ROST', 'RPM', 'RRC', 'RRR', 'RRX', 'RS', 'RSG', 'RTX', 'RUSHA', 'RVMD', 'RVTY', 'RY', 'RYAN',
+    'RYTM', 'SAFT', 'SAH', 'SAIA', 'SAIC', 'SAM', 'SANM', 'SBAC', 'SBCF', 'SBUX', 'SCCO', 'SCHW', 'SCI',
+    'SEB', 'SEDG', 'SEI', 'SEIC', 'SEZL', 'SF', 'SFBS', 'SFM', 'SGI', 'SHAK', 'SHAZ', 'SHOO', 'SHW',
+    'SIGI', 'SITE', 'SITM', 'SJM', 'SKM', 'SKT', 'SKWD', 'SKY', 'SKYW', 'SLAB', 'SLF', 'SLG', 'SLGN',
+    'SM', 'SMA', 'SMCI', 'SMG', 'SMTC', 'SNA', 'SNDK', 'SNDR', 'SNEX', 'SNOW', 'SNPS', 'SNX', 'SO',
+    'SOLS', 'SOLV', 'SON', 'SPB', 'SPCX', 'SPG', 'SPGI', 'SPHR', 'SPSC', 'SPXC', 'SQM', 'SR', 'SRE',
+    'SRRK', 'SSB', 'SSD', 'SSNC', 'STAG', 'STEP', 'STM', 'STN', 'STOK', 'STRA', 'STRL', 'STT', 'STZ',
+    'SU', 'SUI', 'SUNB', 'SUPN', 'SWK', 'SWKS', 'SWX', 'SXI', 'SXT', 'SYF', 'SYK', 'SYM', 'SYNA',
+    'SYRE', 'SYY', 'TAP', 'TARS', 'TBBK', 'TCBI', 'TD', 'TDG', 'TDW', 'TDY', 'TEAM', 'TECH', 'TEM',
+    'TENB', 'TER', 'TEX', 'TFC', 'TFX', 'TGT', 'TGTX', 'THC', 'THO', 'THRM', 'TIGO', 'TJX', 'TKO',
+    'TKR', 'TLN', 'TM', 'TMDX', 'TMO', 'TMUS', 'TNET', 'TOL', 'TOST', 'TOWN', 'TPB', 'TPC', 'TPG',
+    'TPL', 'TPR', 'TREX', 'TRGP', 'TRMB', 'TRNO', 'TROW', 'TRP', 'TRU', 'TRV', 'TSCO', 'TSLA', 'TSN',
+    'TTAN', 'TTC', 'TTEK', 'TTMI', 'TTWO', 'TVTX', 'TW', 'TWLO', 'TWST', 'TXG', 'TXN', 'TXNM', 'TXRH',
+    'TXT', 'TYL', 'U', 'UAL', 'UBER', 'UBSI', 'UCB', 'UCTT', 'UDR', 'UFPI', 'UFPT', 'UGI', 'UHS',
+    'UI', 'ULS', 'ULTA', 'UMBF', 'UNF', 'UNFI', 'UNH', 'UNM', 'UNP', 'UPS', 'URBN', 'URI', 'USB',
+    'USFD', 'UTHR', 'VAC', 'VC', 'VCEL', 'VCTR', 'VCYT', 'VECO', 'VEEV', 'VERA', 'VIAV', 'VICR', 'VIRT',
+    'VKTX', 'VLO', 'VLTO', 'VMC', 'VMI', 'VNO', 'VNOM', 'VNT', 'VOYA', 'VOYG', 'VPG', 'VRNS', 'VRSK',
+    'VRSN', 'VRT', 'VRTS', 'VRTX', 'VSAT', 'VSEC', 'VSH', 'VSNT', 'VST', 'VSXY', 'VTR', 'VVV', 'VVX',
+    'VZ', 'W', 'WAB', 'WAFD', 'WAL', 'WAT', 'WBS', 'WCC', 'WDAY', 'WDC', 'WDFC', 'WEC', 'WELL',
+    'WERN', 'WFC', 'WGS', 'WH', 'WHD', 'WHR', 'WING', 'WK', 'WKC', 'WLK', 'WLY', 'WM', 'WMB',
+    'WMS', 'WMT', 'WRB', 'WRLD', 'WSBC', 'WSFS', 'WSM', 'WSO', 'WST', 'WTFC', 'WTM', 'WTRG', 'WTS',
+    'WWD', 'XEL', 'XMTR', 'XOM', 'XPO', 'XYL', 'XYZ', 'YETI', 'YOU', 'YUMC', 'ZBH', 'ZBRA', 'ZD',
+    'ZG', 'ZION', 'ZM', 'ZS', 'ZTS', 'ZWS'
+]
 
 EXCHANGES = ["NMS", "NGM", "NCM", "NYQ", "ASE"]   # 스크리너 거래소 코드: NASDAQ 3개 시장, NYSE, AMEX
 NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
@@ -615,14 +720,17 @@ def data_ok(m, close_d):
     return close_d > 0 and 0.9 <= float(m["Close"].iloc[-1]) / close_d <= 1.1
 
 
-def scan_today():
-    """전체 스캔: 가장 최근 장에서 시그널이 난 종목 -> 텔레그램 메시지 문자열"""
+def scan_today(use_list=False):
+    """전체 스캔: 가장 최근 장에서 시그널이 난 종목 -> 텔레그램 메시지 문자열
+    use_list=False: 실시간 전체 보통주 목록(NASDAQ 공식) / True: TICKERS 고정 리스트"""
     yf = _yf()
-    uni = load_universe()
+    names = {} if use_list else load_universe()                    # {종목: 회사명}
+    tickers = list(TICKERS) if use_list else sorted(names)
+    src = f"TICKERS {len(tickers)}개" if use_list else f"실시간 전체 보통주 {len(tickers)}개"
     spy = yf.Ticker("SPY").history(period="5d", interval="1d")
     d = spy.index[-1].date()                                       # 가장 최근 장 날짜 (뉴욕)
-    print(f"[1/3] {d} 일봉: 보통주 {len(uni)}개")
-    daily = download_batch(sorted(uni), period="5d", interval="1d")
+    print(f"[1/3] {d} 일봉: {src}")
+    daily = download_batch(tickers, period="5d", interval="1d")
     cands = {}
     for t, df in daily.items():
         today = df[[x.date() == d for x in df.index]]
@@ -642,11 +750,20 @@ def scan_today():
             found.append((t, s))
     print(f"[3/3] 시그널 {len(found)}개")
     if not found:
-        return f"📭 오늘은 시그널 없음\n{d} (뉴욕) | 후보 {len(cands)}개 확인"
-    lines = [f"📈 {d} (뉴욕) 시그널 {len(found)}개 | 후보 {len(cands)}개 확인"]
+        return f"📭 오늘은 시그널 없음\n{d} (뉴욕) | {src} 중 후보 {len(cands)}개 확인"
+    lines = [f"📈 {d} (뉴욕) 시그널 {len(found)}개 | {src} 중 후보 {len(cands)}개 확인"]
     for t, s in sorted(found, key=lambda x: x[1]["time"]):
-        lines.append(f"• {t} {uni.get(t, '')}\n   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)")
+        lines.append(f"• {t} {names.get(t) or company_name(t)}\n"
+                     f"   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)")
     return "\n".join(lines)
+
+
+def company_name(t):
+    """시그널 난 종목만 회사명 조회 (실패하면 빈칸)"""
+    try:
+        return (_yf().Ticker(t).info.get("shortName") or "")[:40]
+    except Exception:
+        return ""
 
 
 def scan_codes(codes):
@@ -692,6 +809,7 @@ def scan_codes(codes):
 def main():
     ap = argparse.ArgumentParser(description="미국 급등주 단타 스캐너 (텔레그램 결과 전송) + 모의투자")
     ap.add_argument("--codes", nargs="+", help="조회할 종목 (예: --codes AAPL TSLA  또는  --codes AAPL,TSLA)")
+    ap.add_argument("--list", action="store_true", help="전체 스캔을 실시간 전체 목록 대신 TICKERS 고정 리스트로")
     ap.add_argument("--paper", action="store_true", help="실시간 모의투자 봇 실행")
     ap.add_argument("--capital", type=float, default=CFG["capital"], help="모의투자 계좌 금액 ($)")
     ap.add_argument("--test-alert", action="store_true", help="휴대폰 알림 테스트만 보내고 종료")
@@ -709,7 +827,7 @@ def main():
     # 한 번 실행 스캔: 결과·오류와 상관없이 텔레그램 메시지 1개 이상
     codes = [c.strip().upper().replace(".", "-") for a in (args.codes or []) for c in a.split(",") if c.strip()]
     try:
-        msg = scan_codes(codes) if codes else scan_today()
+        msg = scan_codes(codes) if codes else scan_today(use_list=args.list)
     except Exception as e:
         traceback.print_exc()
         msg = f"⚠️ 스캔 중 오류가 나서 결과를 만들지 못했습니다\n{type(e).__name__}: {e}"
