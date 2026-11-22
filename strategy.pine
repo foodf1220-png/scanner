@@ -1,0 +1,101 @@
+//@version=6
+// 미국 급등주 단타 (scanner.py 와 같은 조건)
+// 사용법: 1분봉 차트, 정규장만 표시(RTH), 종목은 scanner.py 가 감시하는 급등주
+//
+// 검색  주가 $2 이상, 최근 2일 +20% 급등 없음, 오늘 +20% 이상
+// 신호  뉴욕 09:45~11:30 에 마감한 1분봉이 모두 만족 -> 다음 봉 시가 매수 (하루 1번)
+//       1) 전일 종가 대비 +20% 이상   2) 종가 > VWAP   3) 직전 1분봉 3개 변동폭 3% 이내
+//       4) 종가 < 직전 봉 고가        5) 종가 >= 직전 봉 저가
+// 청산  +4% 익절 / -6% 손절, 한국시간 03:00 강제 청산
+// 운용  계좌의 20% (5칸 중 1칸), 계좌 하루 ±5% 면 청산 후 그날 중단
+//       (트레이딩뷰는 차트 1종목 기준이라 5종목 동시 운용·계좌 전체 기준은 scanner.py 에서만 정확)
+strategy("급등주 단타 (+4/-6)", overlay = true, initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 20,
+     commission_type = strategy.commission.percent, commission_value = 0.25, pyramiding = 0)
+
+// ───── 입력값 ─────
+surgePct   = input.float(20.0, "오늘 상승률 기준 (%)")
+minPrice   = input.float(2.0, "최소 주가 ($)")
+boxBars    = input.int(3, "박스 봉 수", minval = 1)
+boxMaxPct  = input.float(3.0, "박스 변동폭 상한 (%)")
+tpPct      = input.float(4.0, "익절 (%)")
+slPct      = input.float(6.0, "손절 (%)")
+acctPct    = input.float(5.0, "계좌 하루 ± 청산 (%)")
+entrySess  = input.session("0945-1130", "진입 시간 (뉴욕)")
+cutKstHour = input.int(3, "강제 청산 (한국시간 시)", minval = 0, maxval = 23)
+
+// ───── 일봉: 전일 종가, 최근 2일 급등 여부 (미래 데이터 안 씀) ─────
+[c1, c2, c3] = request.security(syminfo.tickerid, "D", [close[1], close[2], close[3]], lookahead = barmerge.lookahead_on)
+fresh  = (c1 / c2 - 1) * 100 < surgePct and (c2 / c3 - 1) * 100 < surgePct
+dayChg = (close / c1 - 1) * 100
+
+// ───── 지표 ─────
+vw       = ta.vwap(hlc3)
+bh       = ta.highest(high[1], boxBars)
+bl       = ta.lowest(low[1], boxBars)
+boxPct   = (bh - bl) / bl * 100
+inside   = close < high[1] and close >= low[1]
+inWin    = not na(time(timeframe.period, entrySess, "America/New_York"))
+kstH     = hour(time_close, "Asia/Seoul")
+afterCut = kstH >= cutKstHour and kstH < 21          // 한국 03:00 ~ 21:00 은 보유하지 않음
+
+// ───── 하루 관리 (뉴욕 날짜 기준) ─────
+var int   tradesToday = 0
+var float dayStartEq  = strategy.initial_capital
+var bool  dayStopped  = false
+etDay = dayofmonth(time, "America/New_York")
+if etDay != etDay[1]
+    tradesToday := 0
+    dayStartEq  := strategy.equity
+    dayStopped  := false
+dayPnl = (strategy.equity - dayStartEq) / dayStartEq * 100
+
+// ───── 신호 ─────
+condChg   = dayChg >= surgePct
+condPrice = close >= minPrice
+condVwap  = close > vw
+condBox   = boxPct <= boxMaxPct
+sig = fresh and condChg and condPrice and condVwap and condBox and inside and inWin
+     and tradesToday == 0 and strategy.position_size == 0 and not dayStopped and not afterCut
+
+if sig
+    strategy.entry("L", strategy.long)
+    strategy.exit("익절/손절", "L", limit = close * (1 + tpPct / 100), stop = close * (1 - slPct / 100))
+    tradesToday += 1
+    alert(syminfo.ticker + " 매수 신호 $" + str.tostring(close) + " (" + str.tostring(dayChg, "#.#") + "%)",
+         alert.freq_once_per_bar_close)
+
+// 체결 후에는 실제 매수가 기준으로 익절·손절 갱신
+if strategy.position_size > 0
+    ep = strategy.position_avg_price
+    strategy.exit("익절/손절", "L", limit = ep * (1 + tpPct / 100), stop = ep * (1 - slPct / 100))
+
+// 계좌 하루 ±5% / 한국 03:00 청산
+if math.abs(dayPnl) >= acctPct
+    dayStopped := true
+    if strategy.position_size > 0
+        strategy.close_all(comment = "계좌 ±" + str.tostring(acctPct) + "%")
+if afterCut and strategy.position_size > 0
+    strategy.close_all(comment = "03시 청산")
+
+// ───── 화면 ─────
+plot(vw, "VWAP", color = color.orange, linewidth = 2)
+plotshape(sig, "매수 신호", shape.triangleup, location.belowbar, color = color.lime, size = size.small,
+     text = "BUY", textcolor = color.lime)
+bgcolor(inWin ? color.new(color.blue, 93) : na, title = "진입 시간")
+
+var table tb = table.new(position.top_right, 2, 8, border_width = 1)
+f_row(r, name, ok) =>
+    table.cell(tb, 0, r, name, text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(tb, 1, r, ok ? "O" : "X", text_color = color.white,
+         bgcolor = ok ? color.new(color.green, 20) : color.new(color.red, 20))
+
+if barstate.islast
+    f_row(0, "최근 2일 급등 없음", fresh)
+    f_row(1, "오늘 " + str.tostring(dayChg, "#.#") + "% (>= " + str.tostring(surgePct) + "%)", condChg)
+    f_row(2, "주가 $" + str.tostring(minPrice) + " 이상", condPrice)
+    f_row(3, "VWAP 위", condVwap)
+    f_row(4, "박스 " + str.tostring(boxPct, "#.##") + "% (<= " + str.tostring(boxMaxPct) + "%)", condBox)
+    f_row(5, "종가가 직전 봉 안", inside)
+    f_row(6, "진입 시간 (뉴욕 09:45~11:30)", inWin)
+    f_row(7, "▶ 매수 신호", sig)
