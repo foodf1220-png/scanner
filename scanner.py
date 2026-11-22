@@ -16,13 +16,18 @@ scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
          시간: 한국 03:00 (뉴욕 13:00, 서머타임 14:00) 남은 종목 전량 청산
   운용   계좌 5칸 (칸마다 계좌의 1/5), 칸이 비면 다음 신호에 다시 사용
 
-[실행] 한국시간 21:00 이후:  python scanner.py   (또는 모의투자_시작.bat 더블클릭)
-       장 시작을 기다렸다가 매매하고, 03:00 또는 할 일이 끝나면 자동 종료 (중지: Ctrl+C)
-[기록] logs/  bot_날짜.log, trades_날짜.csv, signals_날짜.csv, daily_summary.csv
-[휴대폰 알림] 매수·매도·계좌 종료·하루 결과를 알림설정.json 에 적힌 곳으로 보냄
-       ntfy: 휴대폰에 ntfy 앱 설치 -> 알림설정.json 의 ntfy_topic 이름을 구독
-       텔레그램: telegram_token 입력 후 봇에게 아무 메시지 보내고  python scanner.py --test-alert
-       테스트:  python scanner.py --test-alert
+[실행] 모든 실행은 결과와 상관없이 텔레그램 메시지가 최소 1개 감 (오류가 나면 오류 내용)
+  python scanner.py                        전체 스캔: 가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
+  python scanner.py --codes AAPL TSLA      종목 조회: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록
+  python scanner.py --paper                실시간 모의투자 봇 (한국 21:00 이후 실행, 모의투자_시작.bat)
+  python scanner.py --test-alert           알림 테스트
+
+[텔레그램] 환경변수 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 에서 읽음 (코드에 직접 쓰지 않음)
+           환경변수가 없을 때만 알림설정.json 의 telegram_token / telegram_chat_id 사용 (PC 로컬 실행용)
+           API 호출은 파이썬 기본 모듈 urllib 사용 (requests 불필요)
+[ntfy]     모의투자 봇 알림만. 알림설정.json 의 ntfy_topic 을 휴대폰 ntfy 앱에서 구독
+[기록]     모의투자: logs/  bot_날짜.log, trades_날짜.csv, signals_날짜.csv, daily_summary.csv
+[필요 패키지] yfinance, pandas, numpy  (GitHub Actions: pip install yfinance pandas)
 [주의] 모의투자 전용 (실제 주문 없음). yfinance 분봉은 1~2분 늦을 수 있어 진입이 1~2분 늦어짐
 """
 import argparse
@@ -30,13 +35,16 @@ import collections
 import io
 import json
 import os
+import sys
 import time
+import traceback
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGS = os.path.join(HERE, "logs")
@@ -80,58 +88,98 @@ def load_alert():
         return {}
 
 
+def _http(url, data=None, headers=None, timeout=15):
+    """파이썬 기본 모듈(urllib)로 요청. data 가 dict 면 폼 전송, bytes 면 그대로 전송"""
+    if isinstance(data, dict):
+        data = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def telegram_conf():
+    """환경변수 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID (없으면 알림설정.json - PC 로컬용)"""
+    a = load_alert()
+    return (os.environ.get("TELEGRAM_TOKEN") or a.get("telegram_token") or "",
+            os.environ.get("TELEGRAM_CHAT_ID") or a.get("telegram_chat_id") or "")
+
+
+def send_telegram(text):
+    """텔레그램 전송. 4000자 넘으면 나눠서 보냄. 성공하면 True"""
+    token, chat = telegram_conf()
+    if not token or not chat:
+        print("  ! 텔레그램 설정 없음: 환경변수 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 를 설정하세요")
+        return False
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 4000:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n"
+    parts.append(cur)
+    try:
+        for p in parts:
+            r = json.loads(_http(f"https://api.telegram.org/bot{token}/sendMessage",
+                                 {"chat_id": chat, "text": p.strip(), "disable_web_page_preview": "true"}))
+            if not r.get("ok"):
+                print(f"  ! 텔레그램 응답 오류: {r}")
+                return False
+        return True
+    except Exception as e:
+        print(f"  ! 텔레그램 전송 실패: {e}")
+        return False
+
+
 def notify(text, title="급등주 단타"):
-    """알림설정.json 의 ntfy / 텔레그램으로 전송 (실패해도 매매는 계속)"""
+    """모의투자 봇 알림: ntfy + 텔레그램 (실패해도 매매는 계속)"""
     a, sent = load_alert(), []
     if a.get("ntfy_topic"):
         try:
-            requests.post("https://ntfy.sh", json={"topic": a["ntfy_topic"], "title": title, "message": text},
-                          timeout=10).raise_for_status()
+            _http("https://ntfy.sh", json.dumps({"topic": a["ntfy_topic"], "title": title, "message": text}).encode("utf-8"),
+                  {"Content-Type": "application/json"}, timeout=10)
             sent.append("ntfy")
         except Exception as e:
             print(f"  ! ntfy 알림 실패: {e}")
-    if a.get("telegram_token") and a.get("telegram_chat_id"):
-        try:
-            requests.post(f"https://api.telegram.org/bot{a['telegram_token']}/sendMessage",
-                          data={"chat_id": a["telegram_chat_id"], "text": f"[{title}] {text}"},
-                          timeout=10).raise_for_status()
-            sent.append("텔레그램")
-        except Exception as e:
-            print(f"  ! 텔레그램 알림 실패: {e}")
+    if all(telegram_conf()) and send_telegram(f"[{title}] {text}"):
+        sent.append("텔레그램")
     return sent
 
 
 def test_alert():
     a = load_alert()
-    if a.get("telegram_token") and not a.get("telegram_chat_id"):   # 텔레그램 채팅방 번호 자동 찾기
+    token, chat = telegram_conf()
+    if token and not chat:   # 텔레그램 채팅방 번호 자동 찾기 (봇에게 먼저 메시지를 보내야 함)
         try:
-            r = requests.get(f"https://api.telegram.org/bot{a['telegram_token']}/getUpdates", timeout=10).json()
+            r = json.loads(_http(f"https://api.telegram.org/bot{token}/getUpdates"))
             chats = [u["message"]["chat"]["id"] for u in r.get("result", []) if "message" in u]
             if chats:
                 a["telegram_chat_id"] = str(chats[-1])
                 with open(ALERT_FILE, "w", encoding="utf-8") as f:
                     json.dump(a, f, ensure_ascii=False, indent=2)
-                print(f"텔레그램 채팅방 번호 저장: {a['telegram_chat_id']}")
+                print(f"텔레그램 Chat ID: {a['telegram_chat_id']} (알림설정.json 저장, 환경변수 TELEGRAM_CHAT_ID 로도 쓰세요)")
             else:
-                print("텔레그램: 먼저 휴대폰에서 만든 봇에게 아무 메시지나 보낸 뒤 다시 실행하세요.")
+                print("텔레그램: 먼저 휴대폰에서 봇에게 아무 메시지나 보낸 뒤 다시 실행하세요.")
         except Exception as e:
             print(f"텔레그램 확인 실패: {e}")
     sent = notify("알림 테스트입니다. 이 메시지가 보이면 휴대폰 연동 완료!")
-    print(f"보낸 곳: {', '.join(sent) if sent else '없음 (알림설정.json 확인)'}")
+    print(f"보낸 곳: {', '.join(sent) if sent else '없음 (환경변수 또는 알림설정.json 확인)'}")
     if a.get("ntfy_topic"):
         print(f"ntfy 앱에서 구독할 이름(topic): {a['ntfy_topic']}")
 
 
 # ═════════════════════ 보통주 목록 ═════════════════════
 def _read_pipe(url):
-    r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text), sep="|", dtype=str)
+    df = pd.read_csv(io.StringIO(_http(url, timeout=30)), sep="|", dtype=str)
     return df[~df.iloc[:, 0].str.startswith("File Creation Time", na=False)]
 
 
+def clean_name(name):
+    """'Apple Inc. - Common Stock' -> 'Apple Inc.'"""
+    return str(name).split(" - ")[0].replace(" Common Stock", "").strip()[:40]
+
+
 def load_universe():
-    """NYSE·NASDAQ·AMEX 보통주 -> yfinance 표기 종목 코드 집합"""
+    """NYSE·NASDAQ·AMEX 보통주 -> {yfinance 표기 종목 코드: 회사명}"""
     nq = _read_pipe(NASDAQ_URL)
     nq = nq[(nq["Test Issue"] == "N") & (nq["ETF"] == "N")][["Symbol", "Security Name"]]
     ot = _read_pipe(OTHER_URL)
@@ -141,7 +189,7 @@ def load_universe():
     u = u[u["Security Name"].str.contains("common stock", case=False)]
     u = u[~u["Security Name"].str.contains(EXCLUDE_RE, case=False, regex=True)]
     u = u[~u["Symbol"].str.contains(r"[\$\^=]", regex=True)]
-    return set(u["Symbol"].str.replace(".", "-", regex=False))
+    return {s.replace(".", "-"): clean_name(n) for s, n in zip(u["Symbol"], u["Security Name"])}
 
 
 # ═════════════════════ 시간 ═════════════════════
@@ -532,18 +580,143 @@ def run_session(feed, cfg, tag="", live=True):
     return eng
 
 
+# ═════════════════════ 한 번 실행 스캔 (전체 / --codes) ═════════════════════
+def _yf():
+    import yfinance as yf
+    return yf
+
+
+def download_batch(tickers, chunk=100, **kw):
+    """여러 종목을 나눠 받아 {종목: DataFrame}"""
+    yf, out = _yf(), {}
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            df = yf.download(part, group_by="ticker", auto_adjust=True, threads=True, progress=False, **kw)
+            out.update(_split(df, part))
+        except Exception as e:
+            print(f"  ! 다운로드 실패 ({part[0]}~): {e}")
+        print(f"  {min(i + chunk, len(tickers))}/{len(tickers)}", end="\r", flush=True)
+    print()
+    return out
+
+
+def find_signals(code, d, m, pc, fresh, cfg=CFG):
+    """하루치 1분봉 m 에서 시그널 찾기 (모의투자와 같은 엔진, 그날 첫 시그널) -> [dict(time, close, chg)]"""
+    eng = Engine(cfg, d, log=lambda msg: None)
+    eng.add(code, pc, fresh)
+    for t, row in zip(tod_index(m.index), m[["Open", "High", "Low", "Close", "Volume"]].itertuples(index=False)):
+        eng.on_minute(int(t), {code: tuple(float(x) for x in row)})
+    return eng.signals
+
+
+def data_ok(m, close_d):
+    """일봉 종가와 1분봉 마지막 종가가 10% 넘게 다르면 분할 반영 오류 -> 제외"""
+    return close_d > 0 and 0.9 <= float(m["Close"].iloc[-1]) / close_d <= 1.1
+
+
+def scan_today():
+    """전체 스캔: 가장 최근 장에서 시그널이 난 종목 -> 텔레그램 메시지 문자열"""
+    yf = _yf()
+    uni = load_universe()
+    spy = yf.Ticker("SPY").history(period="5d", interval="1d")
+    d = spy.index[-1].date()                                       # 가장 최근 장 날짜 (뉴욕)
+    print(f"[1/3] {d} 일봉: 보통주 {len(uni)}개")
+    daily = download_batch(sorted(uni), period="5d", interval="1d")
+    cands = {}
+    for t, df in daily.items():
+        today = df[[x.date() == d for x in df.index]]
+        info = prev_info(df["Close"][[x.date() < d for x in df.index]].tolist())
+        if len(today) and info and info[1] and float(today["High"].iloc[0]) >= CFG["min_price"] \
+                and float(today["High"].iloc[0]) / info[0] - 1 >= CFG["surge"]:
+            cands[t] = (info, float(today["Close"].iloc[0]))       # 최근 2일 급등 없음 & 오늘 고가 +20%
+    print(f"[2/3] 후보 {len(cands)}개 (최근 2일 급등 없음, 오늘 고가 +20% 이상, $2 이상) 1분봉 확인")
+    mins = download_batch(sorted(cands), chunk=50, period="5d", interval="1m", prepost=False) if cands else {}
+    found = []
+    for t, ((pc, fresh), close_d) in cands.items():
+        m = mins.get(t)
+        m = m[m.index.date == d] if m is not None else None
+        if m is None or len(m) < 30 or not data_ok(m, close_d):
+            continue
+        for s in find_signals(t, d, m, pc, fresh):
+            found.append((t, s))
+    print(f"[3/3] 시그널 {len(found)}개")
+    if not found:
+        return f"📭 오늘은 시그널 없음\n{d} (뉴욕) | 후보 {len(cands)}개 확인"
+    lines = [f"📈 {d} (뉴욕) 시그널 {len(found)}개 | 후보 {len(cands)}개 확인"]
+    for t, s in sorted(found, key=lambda x: x[1]["time"]):
+        lines.append(f"• {t} {uni.get(t, '')}\n   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)")
+    return "\n".join(lines)
+
+
+def scan_codes(codes):
+    """지정 종목: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록 -> 텔레그램 메시지 문자열"""
+    yf = _yf()
+    end = datetime.now()
+    lines = [f"🔎 종목 시그널 조회 (최근 약 30일, {len(codes)}종목)"]
+    for code in codes:
+        tk = yf.Ticker(code)
+        daily = tk.history(period="3mo", interval="1d", auto_adjust=True)
+        frames, w = [], end - timedelta(days=29)
+        while w < end:                                             # 1분봉은 한 번에 최대 8일 -> 7일씩
+            e = min(w + timedelta(days=7), end)
+            try:
+                x = tk.history(start=w, end=e, interval="1m", auto_adjust=True, prepost=False)
+                if not x.empty:
+                    frames.append(x)
+            except Exception as ex:
+                print(f"  ! {code} 1분봉 {w:%m/%d}~ 실패: {ex}")
+            w = e
+        if daily.empty or not frames:
+            lines.append(f"• {code}: 데이터 없음 (종목 코드 확인)")
+            continue
+        mm = pd.concat(frames)
+        mm = mm[~mm.index.duplicated()].sort_index()
+        days, hits = sorted(set(mm.index.date)), []
+        for d in days:
+            m = mm[mm.index.date == d]
+            info = prev_info(daily["Close"][[x.date() < d for x in daily.index]].tolist())
+            today = daily["Close"][[x.date() == d for x in daily.index]]
+            if not info or len(m) < 30 or (len(today) and not data_ok(m, float(today.iloc[0]))):
+                continue
+            hits += [(d, s) for s in find_signals(code, d, m, *info)]
+        print(f"  {code}: {len(days)}일 확인, 시그널 {len(hits)}일")
+        if not hits:
+            lines.append(f"• {code}: 시그널 없음 ({days[0]} ~ {days[-1]}, {len(days)}일)")
+            continue
+        lines.append(f"• {code}: 시그널 {len(hits)}일 ({days[0]} ~ {days[-1]})")
+        lines += [f"   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)" for d, s in hits]
+    return "\n".join(lines)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="미국 급등주 단타 실시간 스캐너 + 모의투자")
+    ap = argparse.ArgumentParser(description="미국 급등주 단타 스캐너 (텔레그램 결과 전송) + 모의투자")
+    ap.add_argument("--codes", nargs="+", help="조회할 종목 (예: --codes AAPL TSLA  또는  --codes AAPL,TSLA)")
+    ap.add_argument("--paper", action="store_true", help="실시간 모의투자 봇 실행")
     ap.add_argument("--capital", type=float, default=CFG["capital"], help="모의투자 계좌 금액 ($)")
     ap.add_argument("--test-alert", action="store_true", help="휴대폰 알림 테스트만 보내고 종료")
     args = ap.parse_args()
     if args.test_alert:
         test_alert()
         return
-    cfg = {**CFG, "capital": args.capital}
-    now = datetime.now(KST)
-    print(f"현재 한국시간 {now:%Y-%m-%d %H:%M}, 뉴욕 {now.astimezone(ET):%H:%M}. 모의투자 시작 (중지: Ctrl+C)")
-    run_session(LiveFeed(), cfg)
+    if args.paper:
+        cfg = {**CFG, "capital": args.capital}
+        now = datetime.now(KST)
+        print(f"현재 한국시간 {now:%Y-%m-%d %H:%M}, 뉴욕 {now.astimezone(ET):%H:%M}. 모의투자 시작 (중지: Ctrl+C)")
+        run_session(LiveFeed(), cfg)
+        return
+
+    # 한 번 실행 스캔: 결과·오류와 상관없이 텔레그램 메시지 1개 이상
+    codes = [c.strip().upper().replace(".", "-") for a in (args.codes or []) for c in a.split(",") if c.strip()]
+    try:
+        msg = scan_codes(codes) if codes else scan_today()
+    except Exception as e:
+        traceback.print_exc()
+        msg = f"⚠️ 스캔 중 오류가 나서 결과를 만들지 못했습니다\n{type(e).__name__}: {e}"
+    print("\n" + msg)
+    if not send_telegram(msg):
+        sys.exit(1)
+    print("\n텔레그램 전송 완료")
 
 
 if __name__ == "__main__":

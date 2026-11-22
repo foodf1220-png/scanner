@@ -1,0 +1,40 @@
+name: 급등주 시그널 스캔
+
+on:
+  workflow_dispatch:            # GitHub Actions 탭에서 "Run workflow" 버튼으로 수동 실행
+    inputs:
+      codes:
+        description: "조회할 종목 (예: AAPL TSLA 또는 AAPL,TSLA). 비우면 전체 스캔"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 코드 내려받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 패키지 설치 (yfinance, pandas)
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas
+
+      - name: scanner.py 실행 (결과를 텔레그램으로 전송)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CODES: ${{ inputs.codes }}
+        run: |
+          if [ -n "$CODES" ]; then
+            python scanner.py --codes $CODES
+          else
+            python scanner.py
+          fi
