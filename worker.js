@@ -1,6 +1,10 @@
 /**
- * worker.js - Cloudflare Worker: 실시간 급등주 신호 (GitHub Actions live.yml) 자동 실행
+ * worker.js - Cloudflare Worker: 장전 급등주 알림 + 실시간 급등주 신호 (GitHub Actions) 자동 실행
  *
+ * [장전] 한국 22:00 (월~금, cron "0 13 * * 1-5" = UTC 13:00) -> premarket.yml 실행
+ *        프리마켓 +20% 이상 급등주를 텔레그램으로 (한국은 서머타임이 없어 1년 내내 22:00)
+ *
+ * [실시간] 아래
  * 매일(월~금) 미국 장 시작 5분 전에 GitHub Actions 를 켜면, Actions 안에서 scanner.py --live 가
  * 장 시작부터 1분마다 확인하고 신호가 나는 즉시 텔레그램으로 보냄 (뉴욕 11:30 신호 시간 끝나면 종료)
  *
@@ -17,6 +21,8 @@
  */
 const REPO = "foodf1220-png/scanner";
 const WORKFLOW = "live.yml";
+const PREMARKET_WORKFLOW = "premarket.yml";
+const PREMARKET_CRON = "0 13 * * 1-5";   // 한국 22:00 장전 급등주
 const MAIN_NY = "09:25";
 const BACKUP_NY = "09:35";
 
@@ -55,9 +61,9 @@ async function alreadyRunningOrDone(token, date) {
   );
 }
 
-async function dispatch(token, label) {
+async function dispatch(token, label, workflow = WORKFLOW) {
   const res = await fetch(
-    `https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`,
+    `https://api.github.com/repos/${REPO}/actions/workflows/${workflow}/dispatches`,
     {
       method: "POST",
       headers: { ...ghHeaders(token), "Content-Type": "application/json" },
@@ -65,7 +71,7 @@ async function dispatch(token, label) {
     }
   );
   if (res.status === 204) {
-    console.log(`[${label}] GitHub Actions 실시간 신호 감시 실행 요청 성공`);
+    console.log(`[${label}] GitHub Actions ${workflow} 실행 요청 성공`);
     return;
   }
   const body = await res.text();
@@ -82,14 +88,19 @@ export default {
       console.log(`주말 — 건너뜀 (뉴욕 ${ny.weekday} ${ny.hm})`);
       return;
     }
-    if (ny.hm !== MAIN_NY && ny.hm !== BACKUP_NY) {
-      console.log(`뉴욕 ${ny.hm} — 서머타임 반대쪽 시각이라 건너뜀`);
-      return;
-    }
 
     const token = env.GH_TOKEN;
     if (!token) {
       throw new Error("GH_TOKEN 비밀값이 없습니다 — Settings > Variables and Secrets 에서 등록하세요");
+    }
+
+    if (event.cron === PREMARKET_CRON) {         // 한국 22:00 장전 급등주
+      await dispatch(token, "장전 급등주", PREMARKET_WORKFLOW);
+      return;
+    }
+    if (ny.hm !== MAIN_NY && ny.hm !== BACKUP_NY) {
+      console.log(`뉴욕 ${ny.hm} — 서머타임 반대쪽 시각이라 건너뜀`);
+      return;
     }
 
     if (ny.hm === BACKUP_NY) {
@@ -111,8 +122,8 @@ export default {
 
   async fetch() {
     return new Response(
-      "scanner 실시간 신호 Worker (cron 전용)\n1차: 뉴욕 09:25 (한국 23:25 / 서머타임 22:25) 실행\n" +
-        "2차: 뉴욕 09:35 실행 기록 없으면 실행\n주말 제외",
+      "scanner Worker (cron 전용)\n장전 급등주: 한국 22:00\n실시간 신호 1차: 뉴욕 09:25 (한국 23:25 / 서머타임 22:25)\n" +
+        "실시간 신호 2차: 뉴욕 09:35 실행 기록 없으면 실행\n주말 제외",
       { headers: { "content-type": "text/plain; charset=utf-8" } }
     );
   },

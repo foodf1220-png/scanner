@@ -21,7 +21,9 @@ scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
                                            가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
   python scanner.py --list                 전체 스캔을 아래 TICKERS 고정 리스트로
   python scanner.py --codes AAPL TSLA      종목 조회: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록
+  python scanner.py --premarket            장전 급등주: 프리마켓 +20% 이상·$2 이상·최근 2일 급등 없는 보통주 (한국 22:00 자동)
   python scanner.py --live                 실시간 신호 감시: 장 시작부터 1분마다 확인, 신호 즉시 텔레그램 (익절·손절가 안내)
+                                           시작할 때 장 시작 직전 급등주도 알리고 장 열리면 바로 감시
                                            신호 시간(뉴욕 09:45~11:30)이 끝나면 오늘 신호 정리 보내고 종료
                                            (GitHub Actions live.yml, Cloudflare Worker 가 매일 장 시작 5분 전에 실행)
   python scanner.py --paper                실시간 모의투자 봇 (한국 21:00 이후 실행, 모의투자_시작.bat)
@@ -596,15 +598,26 @@ def run_session(feed, cfg, tag="", live=True):
     log(f"보통주 {len(universe)}개")
     alert = notify if live else None
     eng = Engine(cfg, d, log, alert)
+    pre_movers = []
     if live:
         if sig_mode:
-            sent = notify(f"📡 실시간 신호 감시 시작 ({d} 미국 장)\n신호 시간 한국 {kst0}~{kst1}, 신호가 나면 바로 알려드려요")
+            msg = f"📡 실시간 신호 감시 시작 ({d} 미국 장)\n신호 시간 한국 {kst0}~{kst1}, 신호가 나면 바로 알려드려요"
+            try:                                  # 장 시작 직전 급등주도 함께 알리고, 장 열리면 바로 감시
+                pre_movers, traded = premarket_movers(d)
+                msg += "\n\n" + premarket_message(pre_movers, traded, "장 시작 직전")
+            except Exception as e:
+                log(f"장전 급등주 확인 실패: {e}")
+            sent = notify(msg)
         else:
             sent = notify(f"📡 모의투자 시작 | 진입 한국 {kst0}~{kst1}, "
                           f"종목 +{cfg['tp']}/-{cfg['sl']}%, 계좌 ±{cfg['day_target']}%")
         log(f"휴대폰 알림: {', '.join(sent) if sent else '설정 없음'}")
     known, tracked, prices, floor = {}, set(), {}, 0
     last_t, first = -1, True
+    for x in pre_movers:                          # 장전 급등주는 장 시작부터 감시
+        known[x["ticker"]] = (x["pc"], True)
+        tracked.add(x["ticker"])
+        eng.add(x["ticker"], x["pc"], True)
 
     if feed.now() < o + timedelta(minutes=1):
         log(f"장 시작 대기 중 (뉴욕 09:30 = 한국 {o.astimezone(KST):%H:%M})")
@@ -806,6 +819,63 @@ def company_name(t):
         return ""
 
 
+def premarket_movers(d=None, top=15):
+    """장전(프리마켓) 급등주: 전일 종가 대비 +20% 이상, $2 이상, 보통주, 최근 2일 급등 없음
+    야후 종목 검색을 250개씩 넘겨 받아 전 종목 프리마켓 등락률 확인 (약 30번 요청, 20초 안팎)
+    반환: (종목 목록 [dict], 오늘 프리마켓 거래가 있는 종목 수)"""
+    yf = _yf()
+    d = d or datetime.now(ET).date()
+    uni = load_universe()
+    q = yf.EquityQuery("is-in", ["exchange", *EXCHANGES])
+    quotes, off = [], 0
+    while True:
+        r = yf.screen(q, offset=off, size=250, sortField="intradaymarketcap", sortAsc=False)
+        got = r.get("quotes", [])
+        quotes += got
+        off += len(got)
+        if not got or off >= (r.get("total") or 0) or off >= 12000:
+            break
+    traded, cands = 0, {}
+    for x in quotes:
+        ts = x.get("preMarketTime")
+        if not ts or datetime.fromtimestamp(ts, ET).date() != d:
+            continue
+        traded += 1
+        s, pct, px = x.get("symbol"), x.get("preMarketChangePercent"), x.get("preMarketPrice")
+        if s in uni and pct is not None and px and pct >= CFG["surge"] * 100 and px >= CFG["min_price"]:
+            cands[s] = (float(px), float(pct), datetime.fromtimestamp(ts, ET), x.get("averageDailyVolume10Day") or 0)
+    if not cands:
+        return [], traded
+    daily = download_batch(sorted(cands), period="1mo", interval="1d")
+    out = []
+    for s, (px, pct, last, avgvol) in cands.items():
+        df = daily.get(s)
+        info = prev_info(df["Close"][[x.date() < d for x in df.index]].tolist()) if df is not None else None
+        if not info or not info[1]:                       # 최근 2일 +20% 급등 종목 제외
+            continue
+        if abs((px / info[0] - 1) * 100 - pct) > 5:       # 분할 등 가격 데이터 불일치 제외
+            continue
+        # 야후는 프리마켓 거래량을 0 으로 줘서 대신 최근 체결 시각과 평소(10일 평균) 거래량을 보여줌
+        out.append(dict(ticker=s, name=uni[s], price=px, chg=pct, last=last, avgvol=int(avgvol), pc=info[0]))
+    out.sort(key=lambda x: -x["chg"])
+    return out[:top], traded
+
+
+def premarket_message(movers, traded, label="장전"):
+    now = datetime.now(ET)
+    head = f"🌅 {label} 급등주 (뉴욕 {now:%H:%M} = 한국 {now.astimezone(KST):%H:%M})"
+    if traded == 0:
+        return head + "\n오늘은 프리마켓 거래가 없습니다 (미국 휴장일일 수 있음)"
+    if not movers:
+        return head + "\n+20% 이상 · $2 이상 · 최근 2일 급등 없음 조건에 맞는 종목 없음"
+    lines = [head, f"+20% 이상 · $2 이상 · 최근 2일 급등 없음: {len(movers)}개"]
+    for x in movers:
+        lines.append(f"• {x['ticker']} {x['chg']:+.1f}% ${x['price']:.2f} | 최근 체결 {x['last']:%H:%M}ET"
+                     f" | 평소 거래량 {x['avgvol'] / 1e6:.1f}M\n   {x['name']}")
+    lines.append("장중 매수 신호(한국 23:45~01:30, 서머타임 22:45~00:30)가 나면 따로 알려드려요")
+    return "\n".join(lines)
+
+
 def scan_codes(codes):
     """지정 종목: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록 -> 텔레그램 메시지 문자열"""
     yf = _yf()
@@ -852,6 +922,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="전체 스캔을 실시간 전체 목록 대신 TICKERS 고정 리스트로")
     ap.add_argument("--paper", action="store_true", help="실시간 모의투자 봇 실행")
     ap.add_argument("--live", action="store_true", help="실시간 신호 감시: 장중 1분마다 확인, 신호 즉시 텔레그램")
+    ap.add_argument("--premarket", action="store_true", help="장전 급등주 알림: 프리마켓 +20%% 이상 종목을 텔레그램으로")
     ap.add_argument("--capital", type=float, default=CFG["capital"], help="모의투자 계좌 금액 ($)")
     ap.add_argument("--test-alert", action="store_true", help="휴대폰 알림 테스트만 보내고 종료")
     args = ap.parse_args()
@@ -873,7 +944,10 @@ def main():
     # 한 번 실행 스캔: 결과·오류와 상관없이 텔레그램 메시지 1개 이상
     codes = [c.strip().upper().replace(".", "-") for a in (args.codes or []) for c in a.split(",") if c.strip()]
     try:
-        msg = scan_codes(codes) if codes else scan_today(use_list=args.list)
+        if args.premarket:
+            msg = premarket_message(*premarket_movers())
+        else:
+            msg = scan_codes(codes) if codes else scan_today(use_list=args.list)
     except Exception as e:
         traceback.print_exc()
         msg = f"⚠️ 스캔 중 오류가 나서 결과를 만들지 못했습니다\n{type(e).__name__}: {e}"

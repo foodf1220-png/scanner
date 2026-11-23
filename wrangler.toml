@@ -6,6 +6,9 @@ compatibility_date = "2026-11-01"
 [triggers]
 # Cloudflare cron 은 UTC 고정. 뉴욕 09:25 / 09:35 가 서머타임이면 UTC 13시, 표준시면 UTC 14시라서 둘 다 걸고
 # worker.js 가 뉴욕 현지 시각으로 맞는 쪽만 실행함
-crons = ["25,35 13,14 * * 1-5"]
+crons = [
+  "0 13 * * 1-5",          # 장전 급등주: UTC 13:00 = 한국 22:00 (월~금)
+  "25,35 13,14 * * 1-5",   # 실시간 신호: 뉴욕 09:25 1차 / 09:35 백업 (서머타임·표준시 둘 다)
+]
 
 # GitHub 토큰은 여기에 쓰지 말고 비밀값으로 등록:  npx wrangler secret put GH_TOKEN
