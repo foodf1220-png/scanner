@@ -602,7 +602,9 @@ def run_session(feed, cfg, tag="", live=True):
             f"계좌 {cfg['slots']}칸, 계좌 +{cfg['day_target']}% / -{cfg['day_stop']}% 청산, 강제 청산 {clock(d, cut)}")
     universe = feed.universe()
     log(f"보통주 {len(universe)}개")
-    alert = notify if live else None
+    title = "실시간 신호" if sig_mode else "모의투자"     # 텔레그램 메시지 앞 [실시간 신호] / [모의투자]
+    say = lambda text: notify(text, title)
+    alert = say if live else None
     eng = Engine(cfg, d, log, alert)
     pre_movers = []
     if live:
@@ -613,9 +615,9 @@ def run_session(feed, cfg, tag="", live=True):
                 msg += "\n\n" + premarket_message(pre_movers, traded, "장 시작 직전")
             except Exception as e:
                 log(f"장전 급등주 확인 실패: {e}")
-            sent = notify(msg)
+            sent = say(msg)
         else:
-            sent = notify(f"📡 모의투자 시작 | 진입 한국 {kst0}~{kst1}, "
+            sent = say(f"📡 모의투자 시작 | 진입 한국 {kst0}~{kst1}, "
                           f"종목 +{cfg['tp']}/-{cfg['sl']}%, 계좌 ±{cfg['day_target']}%")
         log(f"휴대폰 알림: {', '.join(sent) if sent else '설정 없음'}")
     known, tracked, prices, floor = {}, set(), {}, 0
@@ -631,7 +633,7 @@ def run_session(feed, cfg, tag="", live=True):
     if not feed.market_open(d):
         log("오늘은 휴장일입니다.")
         if live and sig_mode:
-            notify("📭 오늘은 미국 휴장일이라 신호 감시를 하지 않습니다")
+            say("📭 오늘은 미국 휴장일이라 신호 감시를 하지 않습니다")
         return
 
     while True:
@@ -722,7 +724,7 @@ def run_session(feed, cfg, tag="", live=True):
         msg = head + (f": {len(rows)}개\n" + "\n".join(r for _, r in sorted(rows)) if rows else "\n오늘은 신호 없음")
         log(msg)
         if live:
-            notify(msg)
+            say(msg)
         logf.close()
         return eng
     if eng.pos:
@@ -738,7 +740,7 @@ def run_session(feed, cfg, tag="", live=True):
     log(f"오늘 결과: 매매 {len(eng.trades)}회 (수익 {wins}회), 하루 손익 {eng.realized:+.2f}% "
         f"(${eng.realized * cfg['capital'] / 100:+,.0f}) | 기록: {LOGS}")
     if live:
-        notify(f"📊 오늘 결과: 매매 {len(eng.trades)}회 (수익 {wins}회)\n"
+        say(f"📊 오늘 결과: 매매 {len(eng.trades)}회 (수익 {wins}회)\n"
                f"계좌 {eng.realized:+.2f}% (${eng.realized * cfg['capital'] / 100:+,.0f}) | {eng.stopped or '종료'}")
     logf.close()
     return eng
