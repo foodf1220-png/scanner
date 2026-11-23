@@ -1,6 +1,11 @@
 # 개인 설정 (휴대폰 알림 구독 이름, 텔레그램 토큰)
 알림설정.json
 
+# Cloudflare Worker 로컬 비밀값·임시 파일
+.dev.vars
+.wrangler/
+node_modules/
+
 # 실행 기록, 임시 파일
 logs/
 cache/

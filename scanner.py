@@ -21,6 +21,9 @@ scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
                                            가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
   python scanner.py --list                 전체 스캔을 아래 TICKERS 고정 리스트로
   python scanner.py --codes AAPL TSLA      종목 조회: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록
+  python scanner.py --live                 실시간 신호 감시: 장 시작부터 1분마다 확인, 신호 즉시 텔레그램 (익절·손절가 안내)
+                                           신호 시간(뉴욕 09:45~11:30)이 끝나면 오늘 신호 정리 보내고 종료
+                                           (GitHub Actions live.yml, Cloudflare Worker 가 매일 장 시작 5분 전에 실행)
   python scanner.py --paper                실시간 모의투자 봇 (한국 21:00 이후 실행, 모의투자_시작.bat)
   python scanner.py --test-alert           알림 테스트
 
@@ -430,8 +433,13 @@ class Engine:
         p = self.pos[tk]
         self.log(f"매수 {tk} {clock(self.d, t)} ${e:.2f} x {qty}주 | 익절 ${p['tp']:.2f} "
                  f"손절 ${p['stop']:.2f} | 보유 {len(self.pos)}/{self.c['slots']}칸")
-        self.alert(f"🟢 매수 {tk} ${e:.2f} ({(e / self.st[tk].pc - 1) * 100:+.1f}%) {clock(self.d, t)}\n"
-                   f"익절 ${p['tp']:.2f} / 손절 ${p['stop']:.2f} | {qty}주 | 보유 {len(self.pos)}/{self.c['slots']}칸")
+        chg = (e / self.st[tk].pc - 1) * 100
+        if self.c.get("signal_mode"):
+            self.alert(f"🔔 매수 신호 {tk} ${e:.2f} ({chg:+.1f}%) {clock(self.d, t)}\n"
+                       f"익절 ${p['tp']:.2f} (+{self.c['tp']:g}%) / 손절 ${p['stop']:.2f} (-{self.c['sl']:g}%)")
+        else:
+            self.alert(f"🟢 매수 {tk} ${e:.2f} ({chg:+.1f}%) {clock(self.d, t)}\n"
+                       f"익절 ${p['tp']:.2f} / 손절 ${p['stop']:.2f} | {qty}주 | 보유 {len(self.pos)}/{self.c['slots']}칸")
 
     def _exit_check(self, tk, t, r):
         p = self.pos[tk]
@@ -454,8 +462,11 @@ class Engine:
                                 exit_time=clock(self.d, t), entry=round(p["entry"], 4), exit=round(px, 4),
                                 gross_pct=round(gross, 3), net_pct=round(net, 3), usd=round(usd, 2), why=why))
         self.log(f"매도 {tk} {clock(self.d, t)} ${px:.2f} {why} {net:+.2f}% (${usd:+.0f}) | 하루 손익 {self.realized:+.2f}%")
-        self.alert(f"{'✅' if net > 0 else '🔻'} 매도 {tk} ${px:.2f} {why} {net:+.2f}% (${usd:+.0f})\n"
-                   f"{clock(self.d, t)} | 오늘 계좌 {self.realized:+.2f}%")
+        if self.c.get("signal_mode"):
+            self.alert(f"{'✅' if gross > 0 else '🔻'} {tk} {why}가 도달 ${px:.2f} ({gross:+.2f}%) {clock(self.d, t)}")
+        else:
+            self.alert(f"{'✅' if net > 0 else '🔻'} 매도 {tk} ${px:.2f} {why} {net:+.2f}% (${usd:+.0f})\n"
+                       f"{clock(self.d, t)} | 오늘 계좌 {self.realized:+.2f}%")
 
     def total_pct(self, prices):
         """계좌 하루 손익 % = 실현 + 평가 (비용 반영)"""
@@ -571,16 +582,27 @@ def run_session(feed, cfg, tag="", live=True):
     if feed.now() >= o + timedelta(minutes=cut):
         log("오늘 운영 시간(한국 %s 까지)이 지났습니다." % cfg["kst_end"])
         return
-    log(f"설정: 진입 {clock(d, t0)}~{clock(d, t1)}, 종목 +{cfg['tp']}% / -{cfg['sl']}%, "
-        f"계좌 {cfg['slots']}칸, 계좌 +{cfg['day_target']}% / -{cfg['day_stop']}% 청산, 강제 청산 {clock(d, cut)}")
+    sig_mode = cfg.get("signal_mode", False)      # True: 실시간 신호만 (--live)
+    kst0, kst1 = clock(d, t0)[-9:-4], clock(d, t1)[-9:-4]
+    if sig_mode and feed.now() > o + timedelta(minutes=t1):
+        log("오늘 신호 시간(뉴욕 11:30)이 이미 지나 실행하지 않습니다.")   # 늦게 시작된 중복 실행 방지
+        return
+    if sig_mode:
+        log(f"설정: 실시간 신호 감시, 신호 시간 {clock(d, t0)}~{clock(d, t1)}, 신호마다 익절 +{cfg['tp']}% / 손절 -{cfg['sl']}% 안내")
+    else:
+        log(f"설정: 진입 {clock(d, t0)}~{clock(d, t1)}, 종목 +{cfg['tp']}% / -{cfg['sl']}%, "
+            f"계좌 {cfg['slots']}칸, 계좌 +{cfg['day_target']}% / -{cfg['day_stop']}% 청산, 강제 청산 {clock(d, cut)}")
     universe = feed.universe()
     log(f"보통주 {len(universe)}개")
     alert = notify if live else None
     eng = Engine(cfg, d, log, alert)
     if live:
-        sent = notify(f"📡 모의투자 시작 | 진입 한국 {clock(d, t0)[-9:-4]}~{clock(d, t1)[-9:-4]}, "
-                      f"종목 +{cfg['tp']}/-{cfg['sl']}%, 계좌 ±{cfg['day_target']}%")
-        log(f"휴대폰 알림: {', '.join(sent) if sent else '설정 없음 (알림설정.json)'}")
+        if sig_mode:
+            sent = notify(f"📡 실시간 신호 감시 시작 ({d} 미국 장)\n신호 시간 한국 {kst0}~{kst1}, 신호가 나면 바로 알려드려요")
+        else:
+            sent = notify(f"📡 모의투자 시작 | 진입 한국 {kst0}~{kst1}, "
+                          f"종목 +{cfg['tp']}/-{cfg['sl']}%, 계좌 ±{cfg['day_target']}%")
+        log(f"휴대폰 알림: {', '.join(sent) if sent else '설정 없음'}")
     known, tracked, prices, floor = {}, set(), {}, 0
     last_t, first = -1, True
 
@@ -589,12 +611,17 @@ def run_session(feed, cfg, tag="", live=True):
         feed.sleep_until(o + timedelta(minutes=1, seconds=8))
     if not feed.market_open(d):
         log("오늘은 휴장일입니다.")
+        if live and sig_mode:
+            notify("📭 오늘은 미국 휴장일이라 신호 감시를 하지 않습니다")
         return
 
     while True:
         now = feed.now()
         tod = (now - o).total_seconds() / 60
         floor = int(tod)
+        if sig_mode and tod > t1 + 2:                 # 실시간 신호 모드: 신호 시간이 끝나면 종료
+            log("신호 시간이 끝나 감시를 마칩니다.")
+            break
         if tod >= cut:
             eng.liquidate(prices, floor, "03시 청산")
             break
@@ -666,6 +693,19 @@ def run_session(feed, cfg, tag="", live=True):
                 f"계좌 손익 {eng.total_pct(prices):+.2f}% (실현 {eng.realized:+.2f}%)")
         feed.sleep_until(o + timedelta(minutes=floor + 1, seconds=8))
 
+    if sig_mode:                                  # 실시간 신호 모드: 오늘 신호 정리 보내고 끝
+        rows = [(x["entry_time"], f"• {x['ticker']} {x['entry_time']} ${x['entry']:.2f} → {x['why']}가 도달 "
+                 f"${x['exit']:.2f} ({x['gross_pct']:+.2f}%)") for x in eng.trades]
+        rows += [(clock(d, p["tod"]), f"• {s} {clock(d, p['tod'])} ${p['entry']:.2f} → 진행 중 "
+                  f"(현재 ${prices.get(s, p['last']):.2f}, {(prices.get(s, p['last']) / p['entry'] - 1) * 100:+.1f}%) "
+                  f"익절 ${p['tp']:.2f} / 손절 ${p['stop']:.2f}") for s, p in eng.pos.items()]
+        head = f"📋 오늘 신호 정리 ({d} 미국 장, 한국 {kst0}~{kst1})"
+        msg = head + (f": {len(rows)}개\n" + "\n".join(r for _, r in sorted(rows)) if rows else "\n오늘은 신호 없음")
+        log(msg)
+        if live:
+            notify(msg)
+        logf.close()
+        return eng
     if eng.pos:
         eng.liquidate(prices, floor, "종료")
     pd.DataFrame(eng.trades).to_csv(os.path.join(LOGS, f"trades_{name}.csv"), index=False, encoding="utf-8-sig")
@@ -811,11 +851,17 @@ def main():
     ap.add_argument("--codes", nargs="+", help="조회할 종목 (예: --codes AAPL TSLA  또는  --codes AAPL,TSLA)")
     ap.add_argument("--list", action="store_true", help="전체 스캔을 실시간 전체 목록 대신 TICKERS 고정 리스트로")
     ap.add_argument("--paper", action="store_true", help="실시간 모의투자 봇 실행")
+    ap.add_argument("--live", action="store_true", help="실시간 신호 감시: 장중 1분마다 확인, 신호 즉시 텔레그램")
     ap.add_argument("--capital", type=float, default=CFG["capital"], help="모의투자 계좌 금액 ($)")
     ap.add_argument("--test-alert", action="store_true", help="휴대폰 알림 테스트만 보내고 종료")
     args = ap.parse_args()
     if args.test_alert:
         test_alert()
+        return
+    if args.live:   # 모든 신호를 알리도록 칸 제한·계좌 청산 없음, 신호 시간 끝나면 정리 메시지 후 종료
+        cfg = {**CFG, "slots": 999, "day_target": 1e9, "day_stop": 1e9, "signal_mode": True}
+        print(f"실시간 신호 감시 시작 (한국 {datetime.now(KST):%H:%M}, 뉴욕 {datetime.now(ET):%H:%M})")
+        run_session(LiveFeed(), cfg, "_live")
         return
     if args.paper:
         cfg = {**CFG, "capital": args.capital}
