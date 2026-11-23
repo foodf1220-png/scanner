@@ -7,10 +7,10 @@
 //       1) 전일 종가 대비 +20% 이상   2) 종가 > VWAP   3) 직전 1분봉 3개 변동폭 3% 이내
 //       4) 종가 < 직전 봉 고가        5) 종가 >= 직전 봉 저가
 // 청산  +4% 익절 / -6% 손절, 한국시간 03:00 강제 청산
-// 운용  계좌의 20% (5칸 중 1칸), 계좌 하루 ±5% 면 청산 후 그날 중단
+// 운용  계좌의 10% (10칸 중 1칸), 계좌 하루 ±5% 면 청산 후 그날 중단
 //       (트레이딩뷰는 차트 1종목 기준이라 5종목 동시 운용·계좌 전체 기준은 scanner.py 에서만 정확)
 strategy("급등주 단타 (+4/-6)", overlay = true, initial_capital = 10000,
-     default_qty_type = strategy.percent_of_equity, default_qty_value = 20,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
      commission_type = strategy.commission.percent, commission_value = 0.25, pyramiding = 0)
 
 // ───── 입력값 ─────
