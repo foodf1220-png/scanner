@@ -3,7 +3,7 @@
 scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
 
 [전략]
-  검색   NYSE·NASDAQ·AMEX 보통주, 주가 $2 이상, 최근 2일 +20% 급등 없음, 오늘 +20% 이상
+  검색   NYSE·NASDAQ·AMEX 보통주, 주가 $0.1 이상, 최근 2일 +20% 급등 없음, 오늘 +20% 이상
   신호   뉴욕 09:45~11:30 (한국 23:45~01:30, 서머타임 22:45~00:30) 에 마감한 1분봉이 모두 만족
            1) 전일 종가 대비 +20% 이상
            2) 종가 > VWAP
@@ -21,7 +21,7 @@ scanner.py - 미국 급등주 단타 실시간 스캐너 + 모의투자
                                            가장 최근 장의 시그널 종목·날짜·종가 (없으면 '오늘은 시그널 없음')
   python scanner.py --list                 전체 스캔을 아래 TICKERS 고정 리스트로
   python scanner.py --codes AAPL TSLA      종목 조회: 최근 약 30일(yfinance 1분봉 한도) 시그널 날짜 목록
-  python scanner.py --premarket            장전 급등주: 프리마켓 +20% 이상·$2 이상·최근 2일 급등 없는 보통주 (한국 22:00 자동)
+  python scanner.py --premarket            장전 급등주: 프리마켓 +20% 이상·$0.1 이상·최근 2일 급등 없는 보통주 (한국 22:00 자동)
   python scanner.py --live                 실시간 신호 감시: 장 시작부터 1분마다 확인, 신호 즉시 텔레그램 (익절·손절가 안내)
                                            시작할 때 장 시작 직전 급등주도 알리고 장 열리면 바로 감시
                                            신호 시간(뉴욕 09:45~11:30)이 끝나면 오늘 신호 정리 보내고 종료
@@ -62,7 +62,7 @@ CFG = dict(
     kst_end="03:00",          # 강제 청산·종료 (한국시간, 다음날)
     entry_start_et="09:45",   # 신규 진입 시작 (뉴욕, 신호 봉 기준)
     entry_end_et="11:30",     # 신규 진입 종료 (뉴욕)
-    min_price=2.0,            # 최소 주가 ($)
+    min_price=0.1,            # 최소 주가 ($) - 사용자 지정 (백테스트는 $2 일 때가 더 좋았음)
     surge=0.20,               # 오늘 상승률 기준 (+20%)
     box_bars=3,               # 직전 박스 봉 수 (1분봉)
     box_max=0.03,             # 박스 변동폭 상한 (3%)
@@ -328,6 +328,12 @@ def clock(d, tod):
     return f"{et:%H:%M}ET({et.astimezone(KST):%H:%M}KST)"
 
 
+def money(x):
+    """가격 표시: $1 이상은 소수 둘째 자리, $1 미만은 넷째 자리 ($0.1248 이 $0.12 로 뭉개지지 않게)"""
+    x = float(x)
+    return f"${x:,.2f}" if x >= 1 else f"${x:.4f}"
+
+
 def tod_index(idx):
     return np.asarray(idx.hour * 60 + idx.minute - 570)
 
@@ -402,7 +408,7 @@ class Engine:
             self.pending[tk] = (t, self.st[tk].dvol)
             self.signals.append(dict(date=self.d, ticker=tk, time=clock(self.d, t), close=round(r[3], 4),
                                      chg=round(chg * 100, 1)))
-            self.log(f"신호 {tk} {clock(self.d, t)} 종가 ${r[3]:.2f} ({chg * 100:+.1f}%) -> 매수 대기")
+            self.log(f"신호 {tk} {clock(self.d, t)} 종가 {money(r[3])} ({chg * 100:+.1f}%) -> 매수 대기")
 
     def _may_signal(self, tk, t):
         return (tk not in self.pos and tk not in self.pending
@@ -433,15 +439,15 @@ class Engine:
                             tod=t, sig=sig_t, last=e)
         qty = int(self.c["capital"] / self.c["slots"] // e)
         p = self.pos[tk]
-        self.log(f"매수 {tk} {clock(self.d, t)} ${e:.2f} x {qty}주 | 익절 ${p['tp']:.2f} "
-                 f"손절 ${p['stop']:.2f} | 보유 {len(self.pos)}/{self.c['slots']}칸")
+        self.log(f"매수 {tk} {clock(self.d, t)} {money(e)} x {qty}주 | 익절 {money(p['tp'])} "
+                 f"손절 {money(p['stop'])} | 보유 {len(self.pos)}/{self.c['slots']}칸")
         chg = (e / self.st[tk].pc - 1) * 100
         if self.c.get("signal_mode"):
-            self.alert(f"🔔 매수 신호 {tk} ${e:.2f} ({chg:+.1f}%) {clock(self.d, t)}\n"
-                       f"익절 ${p['tp']:.2f} (+{self.c['tp']:g}%) / 손절 ${p['stop']:.2f} (-{self.c['sl']:g}%)")
+            self.alert(f"🔔 매수 신호 {tk} {money(e)} ({chg:+.1f}%) {clock(self.d, t)}\n"
+                       f"익절 {money(p['tp'])} (+{self.c['tp']:g}%) / 손절 {money(p['stop'])} (-{self.c['sl']:g}%)")
         else:
-            self.alert(f"🟢 매수 {tk} ${e:.2f} ({chg:+.1f}%) {clock(self.d, t)}\n"
-                       f"익절 ${p['tp']:.2f} / 손절 ${p['stop']:.2f} | {qty}주 | 보유 {len(self.pos)}/{self.c['slots']}칸")
+            self.alert(f"🟢 매수 {tk} {money(e)} ({chg:+.1f}%) {clock(self.d, t)}\n"
+                       f"익절 {money(p['tp'])} / 손절 {money(p['stop'])} | {qty}주 | 보유 {len(self.pos)}/{self.c['slots']}칸")
 
     def _exit_check(self, tk, t, r):
         p = self.pos[tk]
@@ -463,11 +469,11 @@ class Engine:
         self.trades.append(dict(date=self.d, ticker=tk, signal=clock(self.d, p["sig"]), entry_time=clock(self.d, p["tod"]),
                                 exit_time=clock(self.d, t), entry=round(p["entry"], 4), exit=round(px, 4),
                                 gross_pct=round(gross, 3), net_pct=round(net, 3), usd=round(usd, 2), why=why))
-        self.log(f"매도 {tk} {clock(self.d, t)} ${px:.2f} {why} {net:+.2f}% (${usd:+.0f}) | 하루 손익 {self.realized:+.2f}%")
+        self.log(f"매도 {tk} {clock(self.d, t)} {money(px)} {why} {net:+.2f}% (${usd:+.0f}) | 하루 손익 {self.realized:+.2f}%")
         if self.c.get("signal_mode"):
-            self.alert(f"{'✅' if gross > 0 else '🔻'} {tk} {why}가 도달 ${px:.2f} ({gross:+.2f}%) {clock(self.d, t)}")
+            self.alert(f"{'✅' if gross > 0 else '🔻'} {tk} {why}가 도달 {money(px)} ({gross:+.2f}%) {clock(self.d, t)}")
         else:
-            self.alert(f"{'✅' if net > 0 else '🔻'} 매도 {tk} ${px:.2f} {why} {net:+.2f}% (${usd:+.0f})\n"
+            self.alert(f"{'✅' if net > 0 else '🔻'} 매도 {tk} {money(px)} {why} {net:+.2f}% (${usd:+.0f})\n"
                        f"{clock(self.d, t)} | 오늘 계좌 {self.realized:+.2f}%")
 
     def total_pct(self, prices):
@@ -639,7 +645,7 @@ def run_session(feed, cfg, tag="", live=True):
             eng.liquidate(prices, floor, "03시 청산")
             break
 
-        # 1) 급등주 검색: 지금 +20% 이상 -> 보통주, 최근 2일 급등 없음, $2 근처 이상이면 감시
+        # 1) 급등주 검색: 지금 +20% 이상 -> 보통주, 최근 2일 급등 없음, 최소 주가 근처 이상이면 감시
         hits = feed.screen()
         if hits is None:
             log("검색 응답 실패 - 다음 분에 다시 시도")
@@ -657,7 +663,7 @@ def run_session(feed, cfg, tag="", live=True):
             if k and k[1] and s not in tracked and (px or 0) >= cfg["min_price"] * 0.9:
                 tracked.add(s)
                 eng.add(s, *k)
-                log(f"감시 추가 {s} ${px:.2f} ({pct:+.1f}%)")
+                log(f"감시 추가 {s} {money(px)} ({pct:+.1f}%)")
 
         # 2) 1분봉 + 현재가
         T = floor - 1 - cfg["lag_min"]
@@ -707,11 +713,11 @@ def run_session(feed, cfg, tag="", live=True):
         feed.sleep_until(o + timedelta(minutes=floor + 1, seconds=8))
 
     if sig_mode:                                  # 실시간 신호 모드: 오늘 신호 정리 보내고 끝
-        rows = [(x["entry_time"], f"• {x['ticker']} {x['entry_time']} ${x['entry']:.2f} → {x['why']}가 도달 "
-                 f"${x['exit']:.2f} ({x['gross_pct']:+.2f}%)") for x in eng.trades]
-        rows += [(clock(d, p["tod"]), f"• {s} {clock(d, p['tod'])} ${p['entry']:.2f} → 진행 중 "
-                  f"(현재 ${prices.get(s, p['last']):.2f}, {(prices.get(s, p['last']) / p['entry'] - 1) * 100:+.1f}%) "
-                  f"익절 ${p['tp']:.2f} / 손절 ${p['stop']:.2f}") for s, p in eng.pos.items()]
+        rows = [(x["entry_time"], f"• {x['ticker']} {x['entry_time']} {money(x['entry'])} → {x['why']}가 도달 "
+                 f"{money(x['exit'])} ({x['gross_pct']:+.2f}%)") for x in eng.trades]
+        rows += [(clock(d, p["tod"]), f"• {s} {clock(d, p['tod'])} {money(p['entry'])} → 진행 중 "
+                  f"(현재 {money(prices.get(s, p['last']))}, {(prices.get(s, p['last']) / p['entry'] - 1) * 100:+.1f}%) "
+                  f"익절 {money(p['tp'])} / 손절 {money(p['stop'])}") for s, p in eng.pos.items()]
         head = f"📋 오늘 신호 정리 ({d} 미국 장, 한국 {kst0}~{kst1})"
         msg = head + (f": {len(rows)}개\n" + "\n".join(r for _, r in sorted(rows)) if rows else "\n오늘은 신호 없음")
         log(msg)
@@ -791,7 +797,7 @@ def scan_today(use_list=False):
         if len(today) and info and info[1] and float(today["High"].iloc[0]) >= CFG["min_price"] \
                 and float(today["High"].iloc[0]) / info[0] - 1 >= CFG["surge"]:
             cands[t] = (info, float(today["Close"].iloc[0]))       # 최근 2일 급등 없음 & 오늘 고가 +20%
-    print(f"[2/3] 후보 {len(cands)}개 (최근 2일 급등 없음, 오늘 고가 +20% 이상, $2 이상) 1분봉 확인")
+    print(f"[2/3] 후보 {len(cands)}개 (최근 2일 급등 없음, 오늘 고가 +20% 이상, ${CFG['min_price']:g} 이상) 1분봉 확인")
     mins = download_batch(sorted(cands), chunk=50, period="5d", interval="1m", prepost=False) if cands else {}
     found = []
     for t, ((pc, fresh), close_d) in cands.items():
@@ -807,7 +813,7 @@ def scan_today(use_list=False):
     lines = [f"📈 {d} (뉴욕) 시그널 {len(found)}개 | {src} 중 후보 {len(cands)}개 확인"]
     for t, s in sorted(found, key=lambda x: x[1]["time"]):
         lines.append(f"• {t} {names.get(t) or company_name(t)}\n"
-                     f"   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)")
+                     f"   {d} {s['time']} | 종가 {money(s['close'])} ({s['chg']:+.1f}%)")
     return "\n".join(lines)
 
 
@@ -820,7 +826,7 @@ def company_name(t):
 
 
 def premarket_movers(d=None, top=15):
-    """장전(프리마켓) 급등주: 전일 종가 대비 +20% 이상, $2 이상, 보통주, 최근 2일 급등 없음
+    """장전(프리마켓) 급등주: 전일 종가 대비 +20% 이상, 최소 주가 이상, 보통주, 최근 2일 급등 없음
     야후 종목 검색을 250개씩 넘겨 받아 전 종목 프리마켓 등락률 확인 (약 30번 요청, 20초 안팎)
     반환: (종목 목록 [dict], 오늘 프리마켓 거래가 있는 종목 수)"""
     yf = _yf()
@@ -867,10 +873,10 @@ def premarket_message(movers, traded, label="장전"):
     if traded == 0:
         return head + "\n오늘은 프리마켓 거래가 없습니다 (미국 휴장일일 수 있음)"
     if not movers:
-        return head + "\n+20% 이상 · $2 이상 · 최근 2일 급등 없음 조건에 맞는 종목 없음"
-    lines = [head, f"+20% 이상 · $2 이상 · 최근 2일 급등 없음: {len(movers)}개"]
+        return head + f"\n+20% 이상 · ${CFG['min_price']:g} 이상 · 최근 2일 급등 없음 조건에 맞는 종목 없음"
+    lines = [head, f"+20% 이상 · ${CFG['min_price']:g} 이상 · 최근 2일 급등 없음: {len(movers)}개"]
     for x in movers:
-        lines.append(f"• {x['ticker']} {x['chg']:+.1f}% ${x['price']:.2f} | 최근 체결 {x['last']:%H:%M}ET"
+        lines.append(f"• {x['ticker']} {x['chg']:+.1f}% {money(x['price'])} | 최근 체결 {x['last']:%H:%M}ET"
                      f" | 평소 거래량 {x['avgvol'] / 1e6:.1f}M\n   {x['name']}")
     lines.append("장중 매수 신호(한국 23:45~01:30, 서머타임 22:45~00:30)가 나면 따로 알려드려요")
     return "\n".join(lines)
@@ -912,7 +918,7 @@ def scan_codes(codes):
             lines.append(f"• {code}: 시그널 없음 ({days[0]} ~ {days[-1]}, {len(days)}일)")
             continue
         lines.append(f"• {code}: 시그널 {len(hits)}일 ({days[0]} ~ {days[-1]})")
-        lines += [f"   {d} {s['time']} | 종가 ${s['close']:.2f} ({s['chg']:+.1f}%)" for d, s in hits]
+        lines += [f"   {d} {s['time']} | 종가 {money(s['close'])} ({s['chg']:+.1f}%)" for d, s in hits]
     return "\n".join(lines)
 
 
