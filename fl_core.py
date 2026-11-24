@@ -98,8 +98,10 @@ DEFAULTS = {
     "risk_limit_pct": 4.0,              # 예상 계좌 손실(모든 손절이 났을 때) 한도
     "min_order_usd": 50.0,
     "no_reentry": True,
-    # ── 시간 (뉴욕) ──
-    "buy_start_et": "10:00",
+    # ── 시간 ──
+    "buy_start_kst": "23:30",           # 신규 매수 한국 시각 (사용자 지정). 정규장 개장 전이면 개장부터
+    "buy_end_kst": "02:30",
+    "buy_start_et": "10:00",            # buy_*_kst 가 null 일 때 쓰는 뉴욕 시각 (요청서 원안)
     "buy_end_et": "13:30",
     "flatten_before_close_min": 10,
     "no_buy_before_flat_min": 20,       # 조기 폐장일: 강제 청산 20분 전부터 신규 매수 안 함
@@ -217,6 +219,16 @@ def market_hours(d, cfg=None):
     return at(ds, "09:30"), at(ds, close)
 
 
+def kst_on(o, hhmm):
+    """한국 시각 hhmm 중 이 거래일(뉴욕 날짜)에 해당하는 시각 (한국 저녁 = 같은 날, 새벽 = 다음 날). 뉴욕 시각으로 반환"""
+    dd = o.date()
+    for k in (0, 1):
+        x = pd.Timestamp(f"{dd + timedelta(days=k)} {hhmm}").tz_localize(KST_S).tz_convert(ET_S)
+        if x.date() == dd:
+            return x
+    return None
+
+
 def day_windows(d, cfg):
     """그날의 시간표: 개장·마감·강제청산·신규매수 시작/끝 (뉴욕 시각, 서머타임은 tz 가 자동 반영)"""
     mh = market_hours(d, cfg)
@@ -225,14 +237,14 @@ def day_windows(d, cfg):
     o, c = mh
     flat = c - pd.Timedelta(minutes=cfg["flatten_before_close_min"])
     if cfg.get("force_exit_kst"):
-        dd = pd.Timestamp(d).date()
-        for k in (0, 1):
-            x = pd.Timestamp(f"{dd + timedelta(days=k)} {cfg['force_exit_kst']}").tz_localize(KST_S).tz_convert(ET_S)
-            if o < x <= c:
-                flat = min(flat, x)
-                break
-    bs = at(o.date(), cfg["buy_start_et"])
-    be = min(at(o.date(), cfg["buy_end_et"]), flat - pd.Timedelta(minutes=cfg["no_buy_before_flat_min"]))
+        x = kst_on(o, cfg["force_exit_kst"])
+        if x is not None and o < x <= c:
+            flat = min(flat, x)
+    bs = kst_on(o, cfg["buy_start_kst"]) if cfg.get("buy_start_kst") else None
+    be = kst_on(o, cfg["buy_end_kst"]) if cfg.get("buy_end_kst") else None
+    bs = max(o, bs if bs is not None else at(o.date(), cfg["buy_start_et"]))        # 개장 전이면 개장부터
+    be = min(be if be is not None else at(o.date(), cfg["buy_end_et"]),
+             flat - pd.Timedelta(minutes=cfg["no_buy_before_flat_min"]))
     return dict(open=o, close=c, flat=flat, buy_start=bs, buy_end=be, early=c.hour < 16)
 
 

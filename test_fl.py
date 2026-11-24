@@ -91,14 +91,28 @@ class Levels(unittest.TestCase):
 
 
 class Calendar(unittest.TestCase):
-    def test_dst_and_standard(self):
-        w = day_windows("2026-07-15", cfg0())               # 서머타임: 뉴욕 10:00 = 한국 23:00
+    def test_buy_window_kst(self):
+        """신규 매수 한국 23:30~02:30 (사용자 지정): 표준시 = 뉴욕 09:30~12:30, 서머타임 = 뉴욕 10:30~13:30"""
+        kst = lambda t: f"{t.tz_convert('Asia/Seoul'):%H:%M}"
+        w = day_windows(D, cfg0())
+        self.assertEqual((kst(w["buy_start"]), kst(w["buy_end"])), ("23:30", "02:30"))
+        self.assertEqual((f"{w['buy_start']:%H:%M}", f"{w['buy_end']:%H:%M}"), ("09:30", "12:30"))
+        self.assertEqual(f"{w['flat']:%H:%M}", "15:50")     # 보유 종목은 정규장 종료 10분 전까지 관리
+        w = day_windows("2026-07-15", cfg0())
+        self.assertEqual((kst(w["buy_start"]), kst(w["buy_end"])), ("23:30", "02:30"))
+        self.assertEqual(f"{w['buy_start']:%H:%M}", "10:30")
+        w = day_windows(D, cfg0(buy_start_kst="22:00"))     # 개장 전 시각이면 개장부터
+        self.assertEqual(f"{w['buy_start']:%H:%M}", "09:30")
+
+    def test_dst_and_standard_et(self):
+        """요청서 원안 (뉴욕 10:00~13:30): buy_*_kst 를 끄면"""
+        c = cfg0(buy_start_kst=None, buy_end_kst=None)
+        w = day_windows("2026-07-15", c)                    # 서머타임: 뉴욕 10:00 = 한국 23:00
         self.assertEqual(f"{w['buy_start'].tz_convert('Asia/Seoul'):%H:%M}", "23:00")
         self.assertEqual(f"{w['buy_end'].tz_convert('Asia/Seoul'):%H:%M}", "02:30")
-        w = day_windows(D, cfg0())                          # 표준시: 뉴욕 10:00 = 한국 00:00
+        w = day_windows(D, c)                               # 표준시: 뉴욕 10:00 = 한국 00:00
         self.assertEqual(f"{w['buy_start'].tz_convert('Asia/Seoul'):%H:%M}", "00:00")
         self.assertEqual(f"{w['buy_end'].tz_convert('Asia/Seoul'):%H:%M}", "03:30")
-        self.assertEqual(f"{w['flat']:%H:%M}", "15:50")     # 정규장 종료 10분 전
 
     def test_holiday_early_close(self):
         self.assertIsNone(market_hours("2026-11-26"))       # 추수감사절
@@ -160,7 +174,7 @@ class Signal(unittest.TestCase):
 
     def test_time_window(self):
         W, df = make()
-        c = cfg0(buy_start_et="10:40")
+        c = cfg0(buy_start_kst="00:40")                     # 표준시 뉴욕 10:40 부터 -> 10:35 신호는 시간 밖
         self.assertEqual(signals(df, day_windows(D, c), c)[0], [])
 
     def test_lod_mode(self):

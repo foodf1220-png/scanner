@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from fl_core import (COND_KO, COND_ORDER, FILTER_KO, FILTER_ORDER, HERE, LOGS, MIN, NOT_IN_LOD, Account, at,
-                     bar_exit, build_frame, conditions, daily_context, day_windows, early_exit, find_signals,
+                     bar_exit, build_frame, clk, conditions, daily_context, day_windows, early_exit, find_signals,
                      market_hours, money, now_et, regular_1m, required_keys, rvol_profile, structure, ts, with_cfg)
 
 CACHE = os.path.join(HERE, "cache")
@@ -376,8 +376,9 @@ def backtest(cfg, ndays=None, use_cache=True):
         lines.append(s)
 
     days = trading_days(cfg, ndays)
+    W0 = day_windows(days[-1], cfg)
     P(f"Fashionably Late V4.0 백테스트 | {days[0]} ~ {days[-1]} ({len(days)}거래일) | 1분봉 정규장 | "
-      f"매수 {cfg['buy_start_et']}~{cfg['buy_end_et']}ET · 장 마감 {cfg['flatten_before_close_min']:g}분 전 청산")
+      f"신규 매수 {clk(W0['buy_start'])}~{clk(W0['buy_end'])} · 장 마감 {cfg['flatten_before_close_min']:g}분 전 청산")
     uni, daily, cand, m1, h5 = load_data(cfg, days, use_cache, P)
     print("[4/4] 지표·신호·매매 시뮬레이션", flush=True)
     items, skip, notes = {}, collections.Counter(), 0
@@ -400,12 +401,12 @@ def backtest(cfg, ndays=None, use_cache=True):
         K, _ = conditions(it["F"], it["S"], cfg, cfg["structure"], it["dctx"])
         tend = it["F"].index + MIN
         ok = np.asarray((tend >= it["W"]["buy_start"]) & (tend <= it["W"]["buy_end"]))
-        funnel["매수 시간 10:00~13:30"] += bool(ok.any())
+        funnel["매수 시간"] += bool(ok.any())
         for k in keys:
             ok = ok & K[k]
             funnel[k] += bool(ok.any())
     P("[조건 깔때기] 종목·일 수 (앞 조건들과 동시에 만족한 봉이 하루에 한 번이라도 있었던 경우)")
-    P("  " + " → ".join([f"후보 {len(items)}", f"매수 시간 {funnel['매수 시간 10:00~13:30']}"] +
+    P("  " + " → ".join([f"후보 {len(items)}", f"매수 시간 {funnel['매수 시간']}"] +
                         [f"{COND_KO.get(k, FILTER_KO.get(k, k))} {funnel[k]}" for k in keys]))
     base = signals_for(cfg, items)
     fb = first_per_day(base)
