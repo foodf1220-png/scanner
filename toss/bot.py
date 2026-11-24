@@ -7,7 +7,8 @@ bot.py - 토스 자동매수 봇 (FL 신호 → 자동 승인 → 다음 강의 
   2. bot.py 가 새 줄을 읽음 (2분 넘게 지난 신호는 무시)
   3. 토스 API: 토큰 → 계좌 → 달러 예수금 (+ 현재가) 조회 (toss_api_docs.md 규격)
   4. 자동 승인 규칙: 동시에 최대 3종목, 종목당 계좌의 30%, 현금 10% 는 항상 남김
-     -> positions.json 에 status APPROVED 로 저장, 텔레그램에 '달러 예수금: $XXX' 와 [❌ 승인 취소] 버튼
+     -> 포지션 저장소(store.py: SSM /scanner/positions 또는 서버 파일)에 status APPROVED 로 저장,
+        텔레그램에 '달러 예수금: $XXX' 와 [❌ 승인 취소] 버튼
   5. monitor.py(다음 강의)가 APPROVED 를 시장가로 주문하면 PENDING. 5분 안에 주문이 안 들어가면 승인 만료
   6. [❌ 승인 취소]: PENDING 이면 토스 주문도 취소 (이미 체결됐으면 알려 주고 기록 유지)
   - 예수금 조회 실패 -> '예수금 조회 실패, 잠시 후 다시 시도해주세요' + [🔁 다시 시도] [⏭ 패스]
@@ -28,14 +29,12 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-try:
-    import fcntl                                    # 리눅스: positions.json 동시 수정 방지 (monitor.py 와 같이 씀)
-except ImportError:                                 # 윈도우 테스트용
-    fcntl = None
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import store                                        # 포지션 저장소 (SSM /scanner/positions 또는 서버 파일) - monitor.py 와 공용
+from store import clear_symbol, load_positions, positions_lock, save_positions
 
 TOSS_CLIENT_ID     = os.environ["TOSS_CLIENT_ID"]
 TOSS_CLIENT_SECRET = os.environ["TOSS_CLIENT_SECRET"]
@@ -44,7 +43,6 @@ TG_CHAT            = str(os.environ["TELEGRAM_CHAT_ID"])
 TOSS_BASE = "https://openapi.tossinvest.com"
 
 HERE           = os.path.dirname(os.path.abspath(__file__))
-POSITIONS_FILE = os.environ.get("POSITIONS_FILE", os.path.join(HERE, "positions.json"))
 STATE_FILE     = os.path.join(HERE, "bot_state.json")
 SIGNAL_QUEUE   = os.environ.get("FL_SIGNAL_QUEUE", "/home/ubuntu/scanner/state/fl_signal_queue.jsonl")
 
@@ -78,42 +76,6 @@ def now_utc():
 def clock(t):
     t = ts(t) if isinstance(t, str) else t
     return f"{t.astimezone(KST):%H:%M} KST ({t.astimezone(ET):%H:%M} ET)"
-
-
-# ═════════════════════ 포지션 기록 (monitor.py 와 공유) ═════════════════════
-@contextmanager
-def positions_lock():
-    f = open(POSITIONS_FILE + ".lock", "a")
-    try:
-        if fcntl:
-            fcntl.flock(f, fcntl.LOCK_EX)
-        yield
-    finally:
-        if fcntl:
-            fcntl.flock(f, fcntl.LOCK_UN)
-        f.close()
-
-
-def load_positions():
-    try:
-        with open(POSITIONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def save_positions(positions):
-    tmp = POSITIONS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(positions, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, POSITIONS_FILE)
-
-
-def clear_symbol(symbol):
-    with positions_lock():
-        p = load_positions()
-        p.pop(symbol, None)
-        save_positions(p)
 
 
 # ═════════════════════ 텔레그램 ═════════════════════
@@ -243,7 +205,12 @@ def auto_approve(state, sid, message_id):
     s = state["signals"][sid]
     tk = s["tk"]
     head = signal_text(s)
-    positions = load_positions()
+    try:
+        positions = load_positions()
+    except Exception as e:
+        log(f"{tk} 포지션 저장소 읽기 실패: {type(e).__name__}: {e}")
+        return edit_message(TG_CHAT, message_id, f"{head}\n\n⚠️ 포지션 저장소({store.STORE}) 조회 실패, 잠시 후 다시 시도해주세요.",
+                            retry_buttons(sid))
     if tk in positions:
         return edit_message(TG_CHAT, message_id, f"{head}\n\n⏭ 이미 승인·주문·보유 중인 종목이에요 ({positions[tk].get('status')}).")
     if len(positions) >= MAX_POSITIONS:
@@ -308,7 +275,13 @@ def on_signal(state, s):
 
 def handle_cancel(cq, symbol):
     mid = cq["message"]["message_id"]
-    pos = load_positions().get(symbol)
+    try:
+        pos = load_positions().get(symbol)
+    except Exception as e:
+        log(f"{symbol} 포지션 저장소 읽기 실패: {e}")
+        return answer(cq["id"], "저장소 조회 실패, 잠시 후 다시 눌러주세요")
+    if pos and pos.get("status") == "ORDERING":
+        return answer(cq["id"], "지금 주문을 넣는 중이에요. 잠시 후 다시 눌러주세요")
     if not pos:
         answer(cq["id"], f"{symbol}: 이미 정리된 종목이에요")
         return edit_message(TG_CHAT, mid, f"↩ <b>{html.escape(symbol)}</b> 이미 정리된 종목이에요.")
@@ -345,7 +318,10 @@ def status_text():
         lines.append(f"달러 예수금: <b>${get_buying_power(token, get_account_seq(token)):.2f}</b>")
     except Exception:
         lines.append("달러 예수금: 조회 실패, 잠시 후 다시 시도해주세요")
-    positions = load_positions()
+    try:
+        positions = load_positions()
+    except Exception:
+        return "\n".join(lines + [f"포지션 저장소({store.STORE}) 조회 실패"])
     lines.append(f"종목 {len(positions)}/{MAX_POSITIONS} (종목당 {POSITION_PCT:g}% · 현금 {CASH_RESERVE_PCT:g}% 유지)")
     for tk, p in positions.items():
         lines.append(f"• {html.escape(tk)} {p.get('status')} ${float(p.get('budget') or 0):.2f}")
@@ -388,7 +364,7 @@ def handle_update(state, u):
 def expire_approvals():
     """APPROVED 인 채로 일정 시간이 지나면 (monitor.py 가 주문하지 않음) 승인 만료 -> 자리 비움"""
     expired = []
-    with positions_lock():
+    with positions_lock():                                    # 저장소 오류면 예외 -> main 이 기록하고 다음에 다시
         positions = load_positions()
         for tk, p in list(positions.items()):
             if p.get("status") == "APPROVED" and p.get("approved_at") and \
@@ -456,7 +432,10 @@ def check():
     me = tg("getMe", {})
     print("텔레그램 봇:", "@" + me["result"]["username"] if me.get("ok") else f"실패 {me.get('error_code')}")
     print("신호 파일:", SIGNAL_QUEUE, "(있음)" if os.path.exists(SIGNAL_QUEUE) else "(아직 없음 - FL 봇이 첫 신호 때 만듦)")
-    print("포지션 파일:", POSITIONS_FILE, f"{len(load_positions())}종목")
+    try:
+        print("포지션 저장소:", store.describe(), f"{len(load_positions())}종목")
+    except Exception as e:
+        print("포지션 저장소:", store.describe(), f"조회 실패 {type(e).__name__}: {e}")
 
 
 def main():
