@@ -126,6 +126,7 @@ DEFAULTS = {
     "halt_feed": True,
     "armed_vwap_gap_pct": 3.0,          # A 모드: 종가가 VWAP 아래 3% 안이면 10초마다 감시
     "monitor_html": True,
+    "signal_queue": True,               # 신호를 state/fl_signal_queue.jsonl 에 기록 (토스 자동매수 봇 bot.py 가 읽음)
 }
 
 COND_ORDER = ["registered", "price", "liquidity", "surge", "retrace", "pullback_below_vwap", "pullback_volume_drop",

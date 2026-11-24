@@ -436,6 +436,8 @@ class LiveFL:
         elif self.block:
             block = f"신규 매수 중단 ({self.block})"
         ref = st["prices"].get(tk, s["px"])
+        if not self.sig and not self.dry and cfg.get("signal_queue"):
+            self.emit_signal(s, now, ref, block)
         if self.sig:
             lv = levels(ref, s["L"], cfg)
             if lv and (cfg["min_stop_pct"] <= lv["sl_pct"] <= cfg["max_stop_pct"]) and not block:
@@ -444,6 +446,22 @@ class LiveFL:
                          f"눌림 저점 {money(s['L'])}\n당일 {s['chg']:+.0f}% · RVOL {s['rvol'] or 0:.1f} · 점수 {s['score']:.0f}"
                          + (f" · 스프레드 {s['spread_pct']:.2f}%" if s["spread_pct"] is not None else ""))
         acct.submit(s, now, ref, block)
+
+    def emit_signal(self, s, now, ref, block):
+        """토스 자동매수 봇(bot.py)이 읽는 신호 파일 state/fl_signal_queue.jsonl 에 한 줄 추가 (모의 계좌 한도와 무관하게 모든 신호)"""
+        lv = levels(ref, s["L"], self.c)
+        rec = dict(tk=s["tk"], name=s.get("name", ""), mode=s.get("mode"), t=s["t"], t_sig=s.get("t_sig"),
+                   t_detect=iso(now), px=round(float(ref), 6), L=s["L"], SL=lv["SL"] if lv else None,
+                   TP=lv["TP"] if lv else None, sl_pct=round(lv["sl_pct"], 3) if lv else None,
+                   tp_pct=round(lv["tp_pct"], 3) if lv else None, chg=round(s.get("chg") or 0, 2),
+                   rvol=round(s["rvol"], 2) if s.get("rvol") else None, score=s.get("score"),
+                   spread_pct=s.get("spread_pct"), block=block)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(os.path.join(STATE_DIR, "fl_signal_queue.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as e:
+            self.log(f"신호 파일 기록 실패: {e}")
 
     def hot(self, now, W):
         """10초마다: 보유·미체결(+A 모드 교차 직전) 종목 -> 체결, 계좌 ±4%(우선), 익절·손절, 조기 청산 실행"""

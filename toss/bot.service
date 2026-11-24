@@ -1,0 +1,19 @@
+# /etc/systemd/system/bot.service - 토스 자동매수 봇 (toss/bot.py), 키는 /home/ubuntu/bot.env 에서
+[Unit]
+Description=Toss auto-buy bot (bot.py)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/bot
+EnvironmentFile=/home/ubuntu/bot.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/usr/bin/python3 /home/ubuntu/bot/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
