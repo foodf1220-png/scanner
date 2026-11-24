@@ -1,7 +1,8 @@
-name: 눌림목 실시간 신호
+name: FL 실시간 신호
 
 # Cloudflare Worker 가 매일 장 시작 5분 전(뉴욕 09:25)에 실행. 수동 실행도 가능
-# 5분봉 마감마다 전 종목 확인 -> C 알림, B 매수 신호, 청산 결과(±7% · 60분 · 한국 02:30)를 텔레그램으로
+# Fashionably Late V4.0: 1분봉 마감마다 감시 -> 매수 신호(9EMA 의 VWAP 상향 돌파)와 결과(익절·손절·조기청산)를 텔레그램으로
+# GitHub 작업 한 개는 6시간까지라 두 부분으로 나눔: 1부 장 시작 ~ 뉴욕 12:40, 2부가 상태를 이어받아 장 마감 10분 전까지
 on:
   workflow_dispatch:
 
@@ -10,10 +11,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  live:
+  part1:
     runs-on: ubuntu-latest
-    timeout-minutes: 300      # 뉴욕 09:25 ~ 한국 02:30 (서머타임이면 약 4시간)
-
+    timeout-minutes: 300
     steps:
       - name: 코드 내려받기
         uses: actions/checkout@v4
@@ -28,8 +28,49 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas
 
-      - name: 눌림목 실시간 신호 (장 시작 ~ 한국 02:30)
+      - name: FL 실시간 신호 1부 (장 시작 ~ 뉴욕 12:40)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python pullback.py --live
+        run: python fl.py --live --until 12:40
+
+      - name: 상태 넘겨주기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fl-state
+          path: state/
+          retention-days: 2
+          if-no-files-found: ignore
+
+  part2:
+    needs: part1
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 260
+    steps:
+      - name: 코드 내려받기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 패키지 설치 (yfinance, pandas)
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance pandas
+
+      - name: 1부 상태 받기
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: fl-state
+          path: state/
+
+      - name: FL 실시간 신호 2부 (~ 장 마감 10분 전, 하루 정리)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fl.py --live --resume
