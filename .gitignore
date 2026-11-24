@@ -12,3 +12,4 @@ state/
 cache/
 __pycache__/
 *.pyc
+*.pem
