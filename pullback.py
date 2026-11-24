@@ -16,10 +16,12 @@ pullback.py - 미국주식 C자리 눌림목 -> B자리(두 고점 사이 지지
   취소   H2 확정 후 종가 < S / 재접근 후 2봉 안에 반등 없음 / C 후 24봉 안에 B 없음 / 거래일 끝
 [매매] B 신호봉 마감 후 실제 주문 가능한 다음 시세로 모의 매수 (신호봉 종가 체결 가정 안 함)
   종목당 당일 시작 순자산 25%, 미체결 포함 동시 최대 4종목, 동일 종목 추가매수 금지
-  종목 평균 매수가 x1.07 익절 / x0.93 손절
+  종목 평균 매수가 x1.07 익절 / x0.93 손절 / 진입 60분 뒤 청산 / 한국 02:30 전량 청산 후 종료
   계좌 당일 +3% / -3% 처음 도달 -> 거래 잠금, 미체결 취소, 전량 청산, 다음 거래일까지 신규 진입 없음
 [실행]
   python pullback.py --paper      실시간 모의매매 (눌림목_모의투자.bat)
+  python pullback.py --live       실시간 신호 (GitHub Actions, 뉴욕 09:25 Cloudflare Worker 가 실행)
+  python pullback.py --premarket  장전 급등주 알림 (한국 22:00 Cloudflare Worker 가 실행)
   python pullback.py --scan       지금(장 마감 후면 최근 장) 한 번 검색: 검색 범위·패턴 상태만 출력 (주문·알림 없음)
   python pullback.py --backtest   최근 약 30일(야후 1분봉 한도) 백테스트 + 비교 전략(익절 = H1)
   python test_pullback.py         검증 사례 테스트
@@ -41,7 +43,7 @@ from datetime import timedelta
 import numpy as np
 import pandas as pd
 
-from scanner import EXCHANGES, HERE, LOGS, _split, load_universe, money, notify
+from scanner import EXCHANGES, HERE, LOGS, _split, load_universe, money, notify, send_telegram
 
 ET_S, KST_S = "America/New_York", "Asia/Seoul"
 CONFIG_FILE = os.path.join(HERE, "pullback_config.json")
@@ -56,7 +58,10 @@ DEFAULTS = {
     "regular_start_et": "09:30",
     "regular_end_et": "16:00",
     "flatten_before_end_min": 5,
+    "force_exit_kst": "02:30",
     "force_exit_et": None,
+    "max_hold_min": 60,
+    "premarket_alert_pct": 20.0,
     "bar_minutes": 5,
     "surge_lookback_bars": 24,
     "surge_min_pct": 30.0,
@@ -155,10 +160,18 @@ def sess_mask(idx, cfg):
 
 
 def session_times(d, cfg):
-    """(감시 시작, 세션 끝, 남은 포지션 정리 시각)"""
+    """(감시 시작, 세션 끝, 전량 청산·종료 시각). force_exit_kst 가 있으면 서머타임과 상관없이 그 한국 시각"""
     s = at(d, cfg["premarket_start_et"] if cfg["sessions"].get("premarket") else cfg["regular_start_et"])
     e = at(d, cfg["regular_end_et"] if cfg["sessions"].get("regular") else cfg["regular_start_et"])
-    flat = at(d, cfg["force_exit_et"]) if cfg.get("force_exit_et") else e - pd.Timedelta(minutes=cfg["flatten_before_end_min"])
+    flat = e - pd.Timedelta(minutes=cfg["flatten_before_end_min"])
+    if cfg.get("force_exit_kst"):
+        for k in (0, 1):                     # 한국 02:30 = 뉴욕 같은 날 12:30 (서머타임 13:30)
+            x = pd.Timestamp(f"{d + timedelta(days=k)} {cfg['force_exit_kst']}").tz_localize(KST_S).tz_convert(ET_S)
+            if s < x <= e:
+                flat = x
+                break
+    elif cfg.get("force_exit_et"):
+        flat = at(d, cfg["force_exit_et"])
     return s, e, min(flat, e)
 
 
@@ -363,6 +376,7 @@ class Core:
 
     def __init__(self, cfg, st, log=None, alert=None, mode="live", on_save=None):
         self.c, self.st, self.mode = cfg, st, mode
+        self.sig = bool(cfg.get("signal_mode"))          # 실시간 신호 모드 (GitHub): 칸·계좌 제한 없이 모든 신호 안내
         self.log = log or (lambda m: None)
         self.alert, self.on_save = alert, on_save
         defaults = dict(pos={}, orders={}, trk={}, sent=[], entered=[], rows=[], trades=[], last1m={}, prices={},
@@ -523,6 +537,10 @@ class Core:
                                      h1=e["h1"], signal_t=e["t"], seq=st["seq"])
             st["entered"].append(pid)
         result = f"모의 매수 주문 {qty}주 (약 ${qty * ref:,.0f})" if why is None else f"주문 안 함: {why}"
+        if self.sig and why is None:
+            result = (f"매수 신호 (다음 시세 진입 가정) | 익절 +{c['tp_pct']:g}% / 손절 -{c['sl_pct']:g}%"
+                      + (f" / {c['max_hold_min']:g}분 뒤 청산" if c.get("max_hold_min") else "")
+                      + (f" / 한국 {c['force_exit_kst']} 전량 청산" if c.get("force_exit_kst") else ""))
         st["rows"].append(dict(e, result=result, order_id=oid))
         msg = (f"🔔 B 신호 {tk} {clk(e['t'])} 5분봉 마감\n"
                f"H1 {money(e['h1'])} / H2 {money(e['h2'])} / 지지선 S {money(e['S'])}\n"
@@ -562,7 +580,23 @@ class Core:
         for tk in sorted(st["pos"]):
             if tk in rows:
                 self._exit(tk, T, rows[tk])
+        self.time_exits(T)                                  # 이 분에 시세가 없는 종목도 보유 시간 초과면 정리
         self._account(T, {tk: (r[3],) * 4 for tk, r in rows.items()})
+
+    def _hold_why(self):
+        return f"보유 {self.c['max_hold_min']:g}분 청산"
+
+    def _time_due(self, p, T):
+        hold = self.c.get("max_hold_min")
+        return bool(hold) and T >= ts(p["entry_t"]) + pd.Timedelta(minutes=hold)
+
+    def time_exits(self, T):
+        """진입 후 max_hold_min(60분) 지나도 익절·손절이 안 났으면 최근 시세로 정리"""
+        for tk in sorted(self.st["pos"]):
+            p = self.st["pos"][tk]
+            if self._time_due(p, T):
+                q = self.st["prices"].get(tk, p["avg"])
+                self._close(tk, T, q * (1 - self.slip()), self._hold_why(), None, q)
 
     def _fill(self, o, raw_px, T, fill_field):
         st, c = self.st, self.c
@@ -590,13 +624,18 @@ class Core:
                f"H1까지 {p['to_h1']:+.1f}% | 익절 {money(p['tp'])} / 손절 {money(p['sl'])} | "
                f"보유 {len(st['pos'])}/{c['max_positions']}")
         self.log(msg.replace("\n", " | "))
-        self.say_once(f"F|{o['id']}", msg)
+        if not self.sig:                                    # 신호 모드는 B 신호 알림에 이미 안내함
+            self.say_once(f"F|{o['id']}", msg)
 
     def _exit(self, tk, T, r):
         p = self.st["pos"][tk]
         o, h, l, c = r
         if p["entry_field"] == "close" and iso(ts(T).floor("min")) == p["entry_min"]:
             o = h = l = c          # 실시간: 매수한 분봉은 매수 이후 시세(현재가)만 사용
+        if self._time_due(p, T):   # 보유 60분: 그 분이 시작될 때 정리 (백테스트 = 그 분 시가, 실시간 = 현재가)
+            px = o if p["entry_field"] == "open" else c
+            self._close(tk, T, px * (1 - self.slip()), self._hold_why(), None, px)
+            return
         tp, sl = p["tp"], p["sl"]
         if o <= sl:
             self._close(tk, T, o * (1 - self.slip()), "손절", sl, o)
@@ -626,10 +665,13 @@ class Core:
                   target=None if target is None else round(target, 6), trigger=round(trigger, 6),
                   exit_px=round(px, 6), net_usd=round(net, 2), net_pct=round(net / p["cost"] * 100, 3), amb=amb)
         st["trades"].append(tr)
-        icon = "✅" if why == "익절" else "🔻" if why == "손절" else "⏹"
+        icon = "✅" if why == "익절" else "🔻" if why == "손절" else "⏱" if why.startswith("보유") else "⏹"
         msg = (f"{icon} 매도 {tk} {why} ({clk(T)})\n"
                f"목표 {money(target) if target else '-'} | 발동 시세 {money(trigger)} | 체결 {money(px)}\n"
                f"손익 {tr['net_pct']:+.2f}% (${net:+,.2f}) | 오늘 계좌 {self.day_ret():+.2f}%")
+        if self.sig:
+            msg = (f"{icon} {tk} {why} ({clk(T)})\n"
+                   f"진입 {money(p['avg'])} → 청산 {money(px)} | {tr['net_pct']:+.2f}% (수수료·슬리피지 반영)")
         self.log(msg.replace("\n", " | "))
         if not quiet:
             self.say_once(f"X|{p['oid']}", msg)
@@ -743,7 +785,14 @@ def screen_all():
     q = yf.EquityQuery("is-in", ["exchange", *EXCHANGES])
     quotes, off, total = [], 0, 0
     while True:
-        r = yf.screen(q, offset=off, size=250, sortField="intradaymarketcap", sortAsc=False)
+        for attempt in range(4):                     # 야후가 가끔 401·429 를 줌 -> 쉬었다 다시
+            try:
+                r = yf.screen(q, offset=off, size=250, sortField="intradaymarketcap", sortAsc=False)
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(3 * (attempt + 1))
         got = r.get("quotes", [])
         quotes += got
         off += len(got)
@@ -802,8 +851,8 @@ def check_data(raw, daily, d, cfg):
 
 
 # ═════════════════════ 상태 저장 ═════════════════════
-def state_path(d):
-    return os.path.join(STATE_DIR, f"pullback_{pd.Timestamp(d):%Y%m%d}.json")
+def state_path(d, tag=""):
+    return os.path.join(STATE_DIR, f"pullback{tag}_{pd.Timestamp(d):%Y%m%d}.json")
 
 
 def save_json(path, obj):
@@ -827,20 +876,22 @@ def carry_equity(cfg):
     return float(a["equity"]) if a and a.get("equity") else float(cfg["capital"])
 
 
-def write_records(st, d):
+def write_records(st, d, tag=""):
     """신호·체결 기록을 상태에서 통째로 다시 써서 재시작해도 중복 줄이 생기지 않게"""
     os.makedirs(LOGS, exist_ok=True)
-    tag = f"{pd.Timestamp(d):%Y%m%d}"
+    day = f"{pd.Timestamp(d):%Y%m%d}"
     if st["rows"]:
-        pd.DataFrame(st["rows"]).to_csv(os.path.join(LOGS, f"pullback_signals_{tag}.csv"), index=False, encoding="utf-8-sig")
+        pd.DataFrame(st["rows"]).to_csv(os.path.join(LOGS, f"pullback{tag}_signals_{day}.csv"), index=False, encoding="utf-8-sig")
     if st["trades"]:
-        pd.DataFrame(st["trades"]).to_csv(os.path.join(LOGS, f"pullback_trades_{tag}.csv"), index=False, encoding="utf-8-sig")
+        pd.DataFrame(st["trades"]).to_csv(os.path.join(LOGS, f"pullback{tag}_trades_{day}.csv"), index=False, encoding="utf-8-sig")
 
 
 # ═════════════════════ 실시간 모의매매 ═════════════════════
 class LivePaper:
-    def __init__(self, cfg, dry=False):
-        self.c, self.dry = cfg, dry
+    def __init__(self, cfg, dry=False, signal=False):
+        self.c, self.dry, self.sig = cfg, dry, signal
+        self.title = "실시간 신호" if signal else TITLE       # 텔레그램 [실시간 신호] / [눌림목 모의]
+        self.tag = "_live" if signal else ""
         self.raw5, self.excluded, self.trimmed = {}, {}, {}
         self.uni, self.logf, self.cov = None, None, {}
 
@@ -853,7 +904,7 @@ class LivePaper:
             self.logf.flush()
 
     def say(self, text):
-        return [] if self.dry else notify(text, TITLE)
+        return [] if self.dry else notify(text, self.title)
 
     def coverage_text(self):
         v = self.cov
@@ -867,11 +918,15 @@ class LivePaper:
         """전 종목 검색 -> 후보 5분봉 -> 마감된 새 봉만 패턴 처리 -> B 신호는 고정 순서로 주문"""
         cfg = self.c
         t0 = time.time()
-        quotes, total = screen_all()
+        try:
+            quotes, total = screen_all()
+        except Exception as e:                       # 검색기 실패: 지금까지 찾은 후보로 5분봉 판정은 계속
+            self.log(f"전 종목 검색 실패 ({type(e).__name__}: {e}) - 기존 후보 {len(self.raw5)}종목으로 계속")
+            quotes, total = [], self.cov.get("total", 0)
         q = {x["symbol"]: x for x in quotes if x.get("symbol")}
         covered = [s for s in self.uni if s in q]
         rng = 1 + cfg["prefilter_day_range_pct"] / 100
-        cands = set()
+        cands = set(self.raw5) if not q else set()
         for s in covered:
             x = q[s]
             if cfg["sessions"].get("regular") and epoch_date(x.get("regularMarketTime")) == d:
@@ -972,25 +1027,25 @@ class LivePaper:
         now = now_et()
         d = now.date()
         os.makedirs(LOGS, exist_ok=True)
-        self.logf = open(os.path.join(LOGS, f"pullback_{d:%Y%m%d}.log"), "a", encoding="utf-8")
+        self.logf = open(os.path.join(LOGS, f"pullback{self.tag}_{d:%Y%m%d}.log"), "a", encoding="utf-8")
         if now.weekday() >= 5:
             self.log("주말이라 장이 열리지 않습니다.")
             return
         s0, s1, flat = session_times(d, cfg)
         if now >= flat:
-            self.log(f"오늘 세션이 끝났습니다 (정리 시각 {clk(flat)}).")
+            self.log(f"오늘 운영 시간이 끝났습니다 (전량 청산 시각 {clk(flat)}).")
             return
-        path = state_path(d)
+        path = state_path(d, self.tag)
         st = load_json(path)
         restarted = st is not None
         if not restarted:
-            eq = carry_equity(cfg)
+            eq = float(cfg["capital"]) if self.sig else carry_equity(cfg)
             st = dict(day=str(d), start_eq=eq, cash=eq, created=iso(now))
         core = None
 
         def save():
             save_json(path, core.snapshot())
-            write_records(core.st, d)
+            write_records(core.st, d, self.tag)
         core = Core(cfg, st, self.log, self.say, mode="live", on_save=save)
         self.uni = load_universe()
         sess = "+".join(k for k, v in (("프리장", cfg["sessions"].get("premarket")), ("정규장", cfg["sessions"].get("regular"))) if v)
@@ -1027,6 +1082,7 @@ class LivePaper:
                 self.poll_1m(core, now)
             except Exception as e:
                 self.log(f"1분 시세 오류 (다음에 다시): {e}")
+            core.time_exits(now)                          # 시세가 안 들어오는 종목도 60분 지나면 정리
             if now >= next_scan:
                 try:
                     self.scan(core, now, d)
@@ -1036,9 +1092,16 @@ class LivePaper:
                     traceback.print_exc()
                 if first:
                     first = False
-                    self.say(f"📡 눌림목 모의매매 시작 ({d} 미국 장, {sess})\n검색: {self.coverage_text()}\n"
-                             f"C 알림은 주문 없이 추적, B 신호에서만 모의 매수 | 종목 ±{cfg['tp_pct']:g}% · "
-                             f"계좌 ±{cfg['account_target_pct']:g}% · 종목당 {cfg['position_pct']:g}% · 최대 {cfg['max_positions']}종목")
+                    rule = (f"익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}%"
+                            + (f" / 진입 {cfg['max_hold_min']:g}분 뒤 청산" if cfg.get("max_hold_min") else "")
+                            + f" / {clk(flat)} 전량 청산")
+                    if self.sig:
+                        self.say(f"📡 눌림목 실시간 신호 감시 시작 ({d} 미국 장)\n검색: {self.coverage_text()}\n"
+                                 f"5분봉 마감마다 전 종목 확인 → C 알림(주문 없음) · B 매수 신호 즉시 전송\n{rule}")
+                    else:
+                        self.say(f"📡 눌림목 모의매매 시작 ({d} 미국 장, {sess})\n검색: {self.coverage_text()}\n"
+                                 f"C 알림은 주문 없이 추적, B 신호에서만 모의 매수 | 종목당 {cfg['position_pct']:g}% · "
+                                 f"최대 {cfg['max_positions']}종목 · 계좌 ±{cfg['account_target_pct']:g}% 잠금\n{rule}")
                 nxt = now.floor(f"{cfg['bar_minutes']}min") + bar_td(cfg)
                 next_scan = nxt + pd.Timedelta(seconds=cfg["bar_grace_sec"])
             save()
@@ -1052,6 +1115,18 @@ class LivePaper:
         st = core.st
         trades = st["trades"]
         wins = sum(1 for t in trades if t["net_pct"] > 0)
+        if self.sig:
+            lines = [f"📋 오늘 눌림목 신호 정리 ({d})", f"C 알림 {st['n_c']}건 · B 매수 신호 {st['n_b']}건"]
+            for t in trades:
+                lines.append(f"• {t['tk']} {clk(t['entry_t'])} 진입 {money(t['avg'])} → {t['why']} {money(t['exit_px'])} "
+                             f"({t['net_pct']:+.2f}%)")
+            if trades:
+                lines.append(f"승률 {wins}/{len(trades)} ({wins / len(trades) * 100:.0f}%) · 평균 "
+                             f"{np.mean([t['net_pct'] for t in trades]):+.2f}% (비용 반영)")
+            msg = "\n".join(lines)
+            self.log(msg.replace("\n", " | "))
+            core.say_once(f"END|{d}", msg)
+            return
         ret = core.day_ret()
         eq = core.equity()
         lock = st["locked"]
@@ -1078,7 +1153,7 @@ class LivePaper:
         d = spy.index[-1].date()
         self.uni = load_universe()
         core = Core(cfg, dict(day=str(d)), self.log, None, mode="live")
-        now = min(now_et(), session_times(d, cfg)[1])
+        now = min(now_et(), session_times(d, cfg)[2])
         self.log(f"한 번 검색: {d} (뉴욕) 기준, {clk(now)} 까지 마감된 5분봉")
         self.scan(core, now, d)
         ev = [r for r in core.st["rows"] if r["type"] in ("C", "B")]
@@ -1239,6 +1314,7 @@ def backtest(cfg, ndays=None, use_cache=True):
                 skip["분할 의심 앞부분 잘라냄 (제외 아님)"] += 1
             d5 = prepare_5m(raw_d, cfg)
             day5 = d5[d5.index.date == d]
+            day5 = day5[day5.index + bar_td(cfg) <= session_times(d, cfg)[2]]   # 실시간 봇처럼 02:30 이후 봉은 안 봄
             if day5.empty:
                 skip["그날 5분봉 없음"] += 1
                 continue
@@ -1350,7 +1426,9 @@ def backtest(cfg, ndays=None, use_cache=True):
     P("※ 보수 = 한 1분봉 안에서 익절·손절 둘 다 닿으면 손절 먼저, 계좌 -3% 는 보유 종목 저가 기준 / "
       "낙관 = 익절 먼저, 계좌 +3% 는 고가 기준. 불명 = 1분봉으로도 순서를 알 수 없는 건수")
     P(f"※ 비용: 매수·매도 각 {cfg['fee_pct']:g}% 수수료 + 시장가성 체결 {cfg['slippage_pct']:g}% 슬리피지 (익절 지정가는 슬리피지 없음)")
-    P(f"※ 진입: B 신호봉 마감 {cfg['entry_delay_min']}분 뒤 1분봉 시가. 남은 포지션은 {clk(session_times(days[-1], cfg)[2])} 정리")
+    P(f"※ 진입: B 신호봉 마감 {cfg['entry_delay_min']}분 뒤 1분봉 시가. 청산: 익절 +{cfg['tp_pct']:g}% · 손절 -{cfg['sl_pct']:g}%"
+      + (f" · 진입 {cfg['max_hold_min']:g}분 뒤" if cfg.get("max_hold_min") else "")
+      + f" · {clk(session_times(days[-1], cfg)[2])} 전량 (그 이후 봉은 패턴도 안 봄)")
     P(f"(소요 {time.time() - t0:.0f}초)")
     rows = []
     for e, res in common:
@@ -1376,10 +1454,48 @@ def _save_bt(lines, events, common_rows, acct_trades):
     print(f"\n저장: logs/pullback_backtest_{tag}.txt (+ events / common / trades CSV)")
 
 
+# ═════════════════════ 장전 알림 (한국 22:00) ═════════════════════
+def premarket_alert(cfg, top=15):
+    """프리마켓 +20% 이상 보통주 = 오늘 정규장 급등·눌림 후보 (전 종목 검색기, 약 20초)"""
+    now = now_et()
+    d = now.date()
+    uni = load_universe()
+    quotes, _ = screen_all()
+    traded, rows = 0, []
+    for x in quotes:
+        if epoch_date(x.get("preMarketTime")) != d:
+            continue
+        traded += 1
+        s, pc, px = x.get("symbol"), x.get("preMarketChangePercent"), x.get("preMarketPrice")
+        if s in uni and pc is not None and px and pc >= cfg["premarket_alert_pct"]:
+            rows.append((s, float(pc), float(px), pd.Timestamp(int(x["preMarketTime"]), unit="s", tz="UTC"), uni[s]))
+    rows.sort(key=lambda r: -r[1])
+    _, _, flat = session_times(d, cfg)
+    head = f"🌅 장전 급등주 · 눌림목 후보 (뉴욕 {now:%H:%M} = 한국 {now.tz_convert(KST_S):%H:%M})"
+    if traded == 0:
+        return head + "\n오늘은 프리마켓 거래가 없습니다 (미국 휴장일일 수 있음)"
+    lines = [head, f"보통주 프리마켓 +{cfg['premarket_alert_pct']:g}% 이상 {len(rows)}개" + (f" (상위 {top})" if len(rows) > top else "")]
+    for s, pc, px, t, name in rows[:top]:
+        lines.append(f"• {s} {pc:+.1f}% {money(px)} | 최근 체결 {t.tz_convert(ET_S):%H:%M}ET\n   {name}")
+    if not rows:
+        lines.append("조건에 맞는 종목 없음")
+    lines.append(f"정규장 {clk(at(d, cfg['regular_start_et']))}부터 5분봉으로 급등 → 20~40% 눌림 → C 알림, "
+                 f"B자리 나오면 매수 신호 보냄 (청산 ±{cfg['tp_pct']:g}% · {cfg.get('max_hold_min') or '-'}분 · {clk(flat)})")
+    return "\n".join(lines)
+
+
 # ═════════════════════ 실행 ═════════════════════
+def signal_cfg(cfg):
+    """실시간 신호 모드: 칸·현금·계좌 제한 없이 모든 B 신호의 결과(익절·손절·60분·02:30)를 추적해 알림"""
+    return dict(cfg, signal_mode=True, max_positions=10 ** 6, position_pct=1.0, capital=1e9,
+                account_target_pct=1e9, account_stop_pct=1e9)
+
+
 def main():
     ap = argparse.ArgumentParser(description="C자리 눌림목 -> B자리 모의매매 / 백테스트")
     ap.add_argument("--paper", action="store_true", help="실시간 모의매매")
+    ap.add_argument("--live", action="store_true", help="실시간 신호 (GitHub Actions): C 알림·B 매수 신호·청산 결과를 텔레그램으로")
+    ap.add_argument("--premarket", action="store_true", help="장전 급등주 알림 (한국 22:00)")
     ap.add_argument("--scan", action="store_true", help="한 번 검색 (주문·알림 없음)")
     ap.add_argument("--backtest", action="store_true", help="최근 약 30일 백테스트")
     ap.add_argument("--days", type=int, default=None, help="백테스트 거래일 수 (기본: 1분봉 가능한 전체)")
@@ -1388,6 +1504,20 @@ def main():
     ap.add_argument("--config", default=CONFIG_FILE, help="설정 파일 경로")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    if args.live:
+        print(f"눌림목 실시간 신호 (한국 {pd.Timestamp.now(tz=KST_S):%Y-%m-%d %H:%M}, 뉴욕 {now_et():%H:%M})")
+        LivePaper(signal_cfg(cfg), signal=True).run()
+        return
+    if args.premarket:                                   # 결과·오류와 상관없이 텔레그램 1개
+        try:
+            msg = premarket_alert(cfg)
+        except Exception as e:
+            traceback.print_exc()
+            msg = f"⚠️ 장전 급등주 확인 중 오류\n{type(e).__name__}: {e}"
+        print(msg)
+        if not send_telegram(msg):
+            sys.exit(1)
+        return
     if args.backtest:
         backtest(cfg, args.days, use_cache=not args.no_cache)
     elif args.scan:

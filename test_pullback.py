@@ -282,6 +282,42 @@ class 경계사례(unittest.TestCase):
         self.assertEqual(core.st["rows"][-1]["type"], "EXPIRE")
         self.assertIn("거래일 끝", core.st["rows"][-1]["why"])
 
+    def test_진입_60분_지나면_청산(self):
+        for mode, field, px_expect in (("cons", "open", 1.02), ("live", "close", 1.03)):
+            c = cfg()
+            core = pb.Core(c, dict(day=DAY, start_eq=10000.0, cash=10000.0), mode=mode)
+            core.submit_b(fake_b("AAA"), T_FILL, 1.0, T_FILL)
+            core.on_minute(T_FILL, {"AAA": (1.0,) * 4}, field)
+            core.on_minute(T_FILL + pd.Timedelta(minutes=59), {"AAA": (1.01, 1.02, 1.0, 1.01)}, field)
+            self.assertIn("AAA", core.st["pos"])                     # 59분: 아직 보유
+            core.on_minute(T_FILL + pd.Timedelta(minutes=60), {"AAA": (1.02, 1.04, 1.01, 1.03)}, field)
+            self.assertEqual(core.st["pos"], {})
+            t = core.st["trades"][0]
+            self.assertEqual(t["why"], "보유 60분 청산")
+            self.assertAlmostEqual(t["trigger"], px_expect)        # 백테스트 = 그 분 시가, 실시간 = 현재가
+
+    def test_60분_청산은_시세_없는_종목도(self):
+        core, _ = new_core()
+        core.submit_b(fake_b("AAA"), T_FILL, 1.0, T_FILL)
+        fill_all(core, ["AAA"])
+        core.on_minute(T_FILL + pd.Timedelta(minutes=61), {"ZZZ": (5.0,) * 4}, "close")   # AAA 시세 없음
+        self.assertEqual(core.st["trades"][0]["why"], "보유 60분 청산")
+
+    def test_한국_0230_전량청산_시각(self):
+        c = cfg()
+        _, _, flat = pb.session_times(pd.Timestamp("2026-11-24").date(), c)      # 표준시
+        self.assertEqual(flat.strftime("%H:%M"), "12:30")
+        self.assertEqual(flat.tz_convert("Asia/Seoul").strftime("%m-%d %H:%M"), "11-25 02:30")
+        _, _, flat = pb.session_times(pd.Timestamp("2026-07-15").date(), c)      # 서머타임
+        self.assertEqual(flat.strftime("%H:%M"), "13:30")
+        self.assertEqual(flat.tz_convert("Asia/Seoul").strftime("%H:%M"), "02:30")
+
+    def test_실시간_신호모드는_칸_제한_없음(self):
+        core = pb.Core(pb.signal_cfg(cfg()), dict(day=DAY, start_eq=1e9, cash=1e9), mode="live")
+        for k in range(8):
+            self.assertIsNotNone(core.submit_b(fake_b(f"T{k}"), T_FILL, 1.0, T_FILL))
+        self.assertIn("매수 신호", core.st["rows"][-1]["result"])
+
     def test_동시_신호_처리순서_고정(self):
         core, _ = new_core()
         for tk in ("AAA", "BBB", "CCC"):

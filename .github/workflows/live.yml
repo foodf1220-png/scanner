@@ -1,6 +1,7 @@
-name: 실시간 급등주 신호
+name: 눌림목 실시간 신호
 
 # Cloudflare Worker 가 매일 장 시작 5분 전(뉴욕 09:25)에 실행. 수동 실행도 가능
+# 5분봉 마감마다 전 종목 확인 -> C 알림, B 매수 신호, 청산 결과(±7% · 60분 · 한국 02:30)를 텔레그램으로
 on:
   workflow_dispatch:
 
@@ -11,7 +12,7 @@ concurrency:
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300      # 뉴욕 09:25 ~ 한국 02:30 (서머타임이면 약 4시간)
 
     steps:
       - name: 코드 내려받기
@@ -27,8 +28,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance pandas
 
-      - name: 실시간 신호 감시 (장 시작 ~ 뉴욕 11:30, 신호 즉시 텔레그램)
+      - name: 눌림목 실시간 신호 (장 시작 ~ 한국 02:30)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scanner.py --live
+        run: python pullback.py --live
