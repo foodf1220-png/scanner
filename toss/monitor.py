@@ -9,7 +9,12 @@ monitor.py - 승인된 종목 주문·체결 확인 (크론으로 1분마다). 5
       1주도 못 사면 '매수 불가' 텔레그램 + 저장소에서 삭제
       살 수 있으면 시장가 매수 -> PENDING(+order_id) 저장 -> '주문 접수' 텔레그램
   · PENDING: 토스 보유 내역으로 체결 확인 -> OPEN(+매수가·수량) 저장 + '체결 완료' 텔레그램. 아직이면 다음 실행 때
-  · OPEN: 손절·익절은 다음 강의
+  · OPEN: 손절·익절 (사용자 조건, FL): E = 실제 평균 체결가, L = 신호 때 눌림 저점(signal_low), D = E - L
+      손절 SL = E - D/3 (호가 올림), 익절 TP = E + D (호가 내림)  -> 토스 조건주문 2개 (문서 11번, 가격 도달 시 전량 시장가 매도)
+      체결 순간 이미 SL 아래 / TP 위 / E <= L 이면 조건주문 대신 즉시 시장가 매도 (문서 11번 방향 주의)
+      조건주문이 실행돼 보유가 0 이 되면: 두 조건주문 취소 시도 -> not-found 인 쪽이 실행된 것 -> 손절/익절 알림, 남은 주문 취소
+      뉴욕 15:50 (조기 폐장일 12:50) = 장 마감 10분 전: 남은 종목 시장가 매도 -> CLOSING -> 매도 확인 후 '청산 완료'
+        (시장가 매도 = POST /api/v1/orders side SELL: 문서에 예시 없음, 사용자 승인으로 사용)
 [실제 주문 스위치] LIVE_ORDERS=true (bot.env) 일 때만 토스에 주문. 기본은 시험 모드 = 수량 계산·알림만 하고 승인 정리
 [안전장치 (강의 코드에 추가)]
   · 주문 직전 상태를 ORDERING 으로 바꿔 둠 -> 주문 후 저장 전에 꺼져도 다음 실행이 같은 종목을 또 사지 않음
@@ -20,13 +25,14 @@ monitor.py - 승인된 종목 주문·체결 확인 (크론으로 1분마다). 5
 """
 import html
 import json
+import math
 import os
 import sys
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
@@ -43,6 +49,10 @@ TOSS_CLIENT_ID     = os.environ["TOSS_CLIENT_ID"]
 TOSS_CLIENT_SECRET = os.environ["TOSS_CLIENT_SECRET"]
 LIVE_ORDERS        = os.environ.get("LIVE_ORDERS", "false").strip().lower() in ("1", "true", "yes")
 PENDING_ALERT_MIN  = 15            # 주문 후 이 시간이 지나도 체결 확인이 안 되면 1번 알림
+STOP_DIV           = 3.0           # 손절 = E - D / 3
+TARGET_MULT        = 1.0           # 익절 = E + D x 1
+FLATTEN_BEFORE_MIN = 10            # 장 마감 10분 전 청산
+COND_EXPIRE_DAYS   = 90            # 조건주문 유효기간 (문서: 등록일 + 90일 정도)
 
 TOSS_BASE = "https://openapi.tossinvest.com"
 ET = ZoneInfo("America/New_York")
@@ -61,16 +71,46 @@ def log(msg):
     print(f"[{datetime.now(ET):%m-%d %H:%M:%S} ET] {msg}", flush=True)
 
 
+def close_time(now):
+    ch, cm = NYSE_EARLY_CLOSE.get(f"{now:%Y-%m-%d}", (16, 0))
+    return now.replace(hour=ch, minute=cm, second=0, microsecond=0)
+
+
 def is_market_open(now=None):
     """미국 정규장: 뉴욕 09:30~16:00 (서머타임 자동), 주말·휴장일 제외, 조기 폐장일은 13:00 까지"""
     now = now or datetime.now(ET)
-    day = f"{now:%Y-%m-%d}"
-    if now.weekday() >= 5 or day in NYSE_HOLIDAYS:
+    if now.weekday() >= 5 or f"{now:%Y-%m-%d}" in NYSE_HOLIDAYS:
         return False
-    ch, cm = NYSE_EARLY_CLOSE.get(day, (16, 0))
-    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now.replace(hour=ch, minute=cm, second=0, microsecond=0)
-    return open_t <= now < close_t
+    return now.replace(hour=9, minute=30, second=0, microsecond=0) <= now < close_time(now)
+
+
+def is_flatten_time(now=None):
+    """장중이면서 마감 10분 전 이후 (뉴욕 15:50~16:00, 조기 폐장일 12:50~13:00)"""
+    now = now or datetime.now(ET)
+    return is_market_open(now) and now >= close_time(now) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+
+
+def tick(p):
+    return 0.0001 if p < 1 else 0.01
+
+
+def round_tick(x, up):
+    t = tick(x)
+    k = math.ceil(x / t - 1e-7) if up else math.floor(x / t + 1e-7)
+    return round(k * t, 4)
+
+
+def fmt_px(p):
+    return f"{p:.2f}" if p >= 1 else f"{p:.4f}"
+
+
+def exit_levels(E, L):
+    """(손절, 익절) 또는 None (L 없음·체결가가 저점 이하)"""
+    if not L or E <= L:
+        return None
+    D = E - float(L)
+    SL, TP = round_tick(E - D / STOP_DIV, True), round_tick(E + D * TARGET_MULT, False)
+    return (SL, TP) if SL < E < TP else None
 
 
 def send_message(chat_id, text):
@@ -146,9 +186,47 @@ def get_holding(token, account_seq, symbol):
         return None, None
 
 
+def toss_delete(path, token, account_seq):
+    req = urllib.request.Request(f"{TOSS_BASE}{path}", method="DELETE")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("X-Tossinvest-Account", str(account_seq))
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = r.read()
+        return json.loads(body) if body else {}
+
+
 def place_market_buy(token, account_seq, symbol, quantity):
     return toss_post("/api/v1/orders", token, account_seq,
                      {"symbol": symbol, "side": "BUY", "orderType": "MARKET", "quantity": str(int(quantity))})
+
+
+def place_market_sell(token, account_seq, symbol, quantity):
+    """시장가 매도. 문서에는 BUY 예시만 있음 - 같은 주문 API 에 side SELL (사용자 승인)"""
+    return toss_post("/api/v1/orders", token, account_seq,
+                     {"symbol": symbol, "side": "SELL", "orderType": "MARKET", "quantity": str(int(quantity))})
+
+
+def place_conditional_sell(token, account_seq, symbol, quantity, trigger):
+    """조건주문 (문서 11번): 트리거 가격 도달 시 전량 시장가 매도. 현재가보다 낮으면 '내려가면', 높으면 '올라가면'"""
+    expire = (datetime.now(ET) + timedelta(days=COND_EXPIRE_DAYS)).strftime("%Y-%m-%d")
+    r = toss_post("/api/v1/conditional-orders", token, account_seq,
+                  {"symbol": symbol, "type": "SINGLE", "orderType": "MARKET", "quantity": str(int(quantity)),
+                   "expireDate": expire, "first": {"orderSide": "SELL", "triggerPrice": fmt_px(trigger)}})
+    return r["result"]["conditionalOrderId"]
+
+
+def cancel_conditional(token, account_seq, cid):
+    """'cancelled' (활성 -> 취소함) / 'gone' (not-found: 이미 실행·취소·만료) / 'error: ...'"""
+    if not cid:
+        return "none"
+    try:
+        toss_delete(f"/api/v1/conditional-orders/{cid}", token, account_seq)
+        return "cancelled"
+    except urllib.error.HTTPError as e:
+        code, msg = _read_error(e)
+        return "gone" if "not-found" in (code + msg) else f"error: {e.code} {code} {msg[:80]}"
+    except Exception as e:
+        return f"error: {type(e).__name__}"
 
 
 # ── 상태별 처리 ──────────────────────────────────────────────────────────────
@@ -243,6 +321,153 @@ def handle_pending(token, symbol, pos):
     log(f"{symbol} 체결 완료 {filled:g}주 @ ${buy_price:.4f}")
     part = f" (주문 {ordered}주 중 일부)" if ordered and filled < ordered else ""
     send_message(pos["chat_id"], f"🔔 {b(symbol)} 체결 완료!\n\n매수가: ${buy_price:.2f} × {filled:g}주{part}")
+    setup_exits(token, symbol, dict(pos, status="OPEN", buy_price=round(buy_price, 4), quantity=filled))
+
+
+# ── 손절·익절·장 마감 청산 ────────────────────────────────────────────────────
+
+def pnl_text(E, px):
+    return f"{(px / E - 1) * 100:+.2f}%" if E else ""
+
+
+def setup_exits(token, symbol, pos):
+    """체결 직후 (또는 조건주문 등록이 빠진 OPEN): 손절·익절 조건주문 등록. 이미 넘어섰으면 즉시 매도"""
+    if not LIVE_ORDERS:
+        log(f"{symbol} 시험 모드 - 손절·익절 주문 안 함")
+        return
+    acc, E, qty = pos["account_seq"], float(pos["buy_price"]), int(float(pos["quantity"]))
+    lv = exit_levels(E, pos.get("signal_low"))
+    if lv is None:
+        return start_close(token, symbol, pos, f"체결가 ${E:.2f} 가 눌림 저점 이하 (손절가 계산 불가) → 즉시 청산")
+    SL, TP = lv
+    price = get_current_price(token, symbol)
+    if is_flatten_time():
+        return start_close(token, symbol, pos, f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산")
+    if price <= SL:
+        return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 손절가 ${fmt_px(SL)} 이하 → 즉시 손절")
+    if price >= TP:
+        return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 익절가 ${fmt_px(TP)} 이상 → 즉시 익절")
+    ids, failed = {}, []
+    for kind, trig in (("sl", SL), ("tp", TP)):
+        if pos.get(f"{kind}_id"):
+            continue
+        try:
+            ids[f"{kind}_id"] = place_conditional_sell(token, acc, symbol, qty, trig)
+        except Exception as e:
+            code, msg = _read_error(e) if isinstance(e, urllib.error.HTTPError) else ("", str(e))
+            log(f"{symbol} {'손절' if kind == 'sl' else '익절'} 조건주문 실패: {code} {msg}")
+            failed.append("손절" if kind == "sl" else "익절")
+    update_position(symbol, SL=SL, TP=TP, **ids)
+    log(f"{symbol} 조건주문 손절 ${fmt_px(SL)} / 익절 ${fmt_px(TP)} 등록" + (f" (실패: {', '.join(failed)} - 다음 실행 때 다시)" if failed else ""))
+    if not pos.get("exits_announced"):
+        update_position(symbol, exits_announced=True)
+        flat = close_time(datetime.now(ET)) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+        send_message(pos["chat_id"],
+                     f"🛡 {b(symbol)} 손절·익절 등록\n\n매수가 ${E:.2f} · 눌림 저점 ${fmt_px(float(pos['signal_low']))}\n"
+                     f"손절 ${fmt_px(SL)} ({pnl_text(E, SL)}) · 익절 ${fmt_px(TP)} ({pnl_text(E, TP)})\n"
+                     f"둘 다 안 닿으면 뉴욕 {flat:%H:%M} (한국 {flat.astimezone(ZoneInfo('Asia/Seoul')):%H:%M}) 에 시장가 청산"
+                     + (f"\n⚠️ {', '.join(failed)} 조건주문 등록 실패 - 1분 뒤 다시 시도" if failed else ""))
+
+
+def start_close(token, symbol, pos, why):
+    """시장가 매도로 청산 시작 -> CLOSING. 매도가 성공한 뒤에 조건주문 취소 (실패해도 손절·익절 보호 유지)"""
+    acc, E = pos["account_seq"], float(pos.get("buy_price") or 0)
+    qty_now, _ = get_holding(token, acc, symbol)
+    if qty_now is None:
+        return
+    held = int(qty_now - float(pos.get("base_qty") or 0))
+    if held < 1:
+        return resolve_closed(token, symbol, pos)
+    try:
+        oid = place_market_sell(token, acc, symbol, held)["result"]["orderId"]
+    except Exception as e:
+        code, msg = _read_error(e) if isinstance(e, urllib.error.HTTPError) else ("", str(e))
+        log(f"{symbol} 시장가 매도 실패: {code} {msg} - 조건주문을 취소하고 다시 시도")
+        for k in ("sl_id", "tp_id"):                              # 조건주문이 수량을 묶고 있을 수 있음
+            cancel_conditional(token, acc, pos.get(k))
+        update_position(symbol, sl_id=None, tp_id=None)
+        pos = dict(pos, sl_id=None, tp_id=None)
+        try:
+            oid = place_market_sell(token, acc, symbol, held)["result"]["orderId"]
+        except Exception as e2:
+            code, msg = _read_error(e2) if isinstance(e2, urllib.error.HTTPError) else ("", str(e2))
+            log(f"{symbol} 시장가 매도 재시도 실패: {code} {msg}")
+            if not pos.get("close_alerted"):
+                update_position(symbol, close_alerted=True)
+                send_message(pos["chat_id"], f"⚠️ {b(symbol)} 청산 매도 실패 ({html.escape(why)})\n오류: {html.escape(code or msg)}\n"
+                                             f"1분마다 다시 시도해요. 급하면 토스 앱에서 직접 매도해주세요.")
+            return
+    for k in ("sl_id", "tp_id"):
+        r = cancel_conditional(token, acc, pos.get(k))
+        if r.startswith("error"):
+            log(f"{symbol} 조건주문 취소 오류 ({k}): {r}")
+    try:
+        price = get_current_price(token, symbol)
+    except Exception:
+        price = 0.0
+    update_position(symbol, status="CLOSING", close_reason=why, sell_order_id=oid, sell_qty=held,
+                    closing_at=now_iso(), close_ref_price=price, sl_id=None, tp_id=None)
+    log(f"{symbol} 청산 매도 주문 {held}주 ({why})")
+    send_message(pos["chat_id"], f"⏰ {b(symbol)} {html.escape(why)}\n\n시장가 매도 주문 {held}주"
+                                 + (f" (현재가 약 ${price:.2f}, {pnl_text(E, price)})" if price else ""))
+
+
+def resolve_closed(token, symbol, pos):
+    """보유가 사라짐 = 조건주문 실행(또는 직접 매도). 취소 시도로 어느 쪽이 실행됐는지 판단 후 정리"""
+    acc, E = pos["account_seq"], float(pos.get("buy_price") or 0)
+    r = {k: cancel_conditional(token, acc, pos.get(f"{k}_id")) for k in ("sl", "tp")}
+    if r["sl"] == "gone" and r["tp"] != "gone":
+        why, px, mark = "손절 실행 (조건주문)", float(pos.get("SL") or 0), "🔻"
+    elif r["tp"] == "gone" and r["sl"] != "gone":
+        why, px, mark = "익절 실행 (조건주문)", float(pos.get("TP") or 0), "✅"
+    else:
+        why, mark = "청산 확인 (직접 매도했거나 조건주문 상태를 토스 앱에서 확인해주세요)", "ℹ️"
+        try:
+            px = get_current_price(token, symbol)
+        except Exception:
+            px = 0.0
+    clear_symbol(symbol)
+    log(f"{symbol} {why} - 매수 ${E:.2f} → 약 ${px:.2f} (조건주문 취소 결과 {r})")
+    send_message(pos["chat_id"], f"{mark} {b(symbol)} {html.escape(why)}\n\n매수 ${E:.2f} → 약 ${px:.2f} "
+                                 f"({pnl_text(E, px)}, 수수료 전) × {float(pos.get('quantity') or 0):g}주\n남은 조건주문은 취소했어요.")
+
+
+def handle_open(token, symbol, pos):
+    if not LIVE_ORDERS:
+        log(f"{symbol} 보유 중 (시험 모드 - 청산 주문 안 함)")
+        return
+    qty_now, _ = get_holding(token, pos["account_seq"], symbol)
+    if qty_now is None:
+        return
+    if qty_now - float(pos.get("base_qty") or 0) < 1:
+        return resolve_closed(token, symbol, pos)
+    if is_flatten_time():
+        return start_close(token, symbol, pos, f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산")
+    if not (pos.get("sl_id") and pos.get("tp_id")):
+        return setup_exits(token, symbol, pos)
+    log(f"{symbol} 보유 중 - 손절 ${fmt_px(float(pos['SL']))} / 익절 ${fmt_px(float(pos['TP']))} 조건주문 대기")
+
+
+def handle_closing(token, symbol, pos):
+    qty_now, _ = get_holding(token, pos["account_seq"], symbol)
+    if qty_now is None:
+        return
+    E = float(pos.get("buy_price") or 0)
+    if qty_now - float(pos.get("base_qty") or 0) < 1:
+        try:
+            px = get_current_price(token, symbol)
+        except Exception:
+            px = float(pos.get("close_ref_price") or 0)
+        clear_symbol(symbol)
+        log(f"{symbol} 청산 완료 ({pos.get('close_reason')})")
+        send_message(pos["chat_id"], f"✅ {b(symbol)} 청산 완료 - {html.escape(str(pos.get('close_reason')))}\n\n"
+                                     f"매수 ${E:.2f} → 약 ${px:.2f} ({pnl_text(E, px)}, 수수료 전) × {pos.get('sell_qty')}주")
+        return
+    minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(pos.get("closing_at") or now_iso())).total_seconds() / 60
+    log(f"{symbol} 청산 매도 체결 대기 ({minutes:.0f}분)")
+    if minutes >= PENDING_ALERT_MIN and not pos.get("closing_alerted"):
+        update_position(symbol, closing_alerted=True)
+        send_message(pos["chat_id"], f"⏳ {b(symbol)} 청산 매도 후 {minutes:.0f}분째 체결 확인이 안 돼요. 토스 앱에서 확인해주세요.")
 
 
 def handle_ordering(symbol, pos):
@@ -292,7 +517,9 @@ def main():
             elif status == "ORDERING":
                 handle_ordering(symbol, pos)
             elif status == "OPEN":
-                log(f"{symbol} 보유 중 (손절·익절은 다음 강의)")
+                handle_open(token, symbol, pos)
+            elif status == "CLOSING":
+                handle_closing(token, symbol, pos)
         except Exception as e:
             log(f"{symbol} 처리 오류: {type(e).__name__}: {e}")
             traceback.print_exc()
