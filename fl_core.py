@@ -877,9 +877,18 @@ class Account:
         part = "" if o["status"] == "filled" else f" (부분 체결 {o['filled']}/{o['qty']}주)"
         self.log(f"{tk} 매수 체결 {q:,}주 @ {money(px)}{part} → 손절 {money(p['SL'])} / 익절 {money(p['TP'])}")
         if self.alert and not self.sig:
-            self.alert(f"🟢 매수 체결 {tk} {q:,}주 @ {money(px)}{part}\n손절 {money(p['SL'])} (-{p['sl_pct']:.2f}%) · "
-                       f"익절 {money(p['TP'])} (+{p['tp_pct']:.2f}%) · 눌림 저점 {money(p['L'])}\n"
-                       f"계좌 {self.day_ret():+.2f}% · 예상 계좌 손실 -{self.expected_loss_pct():.2f}%")
+            s = o["sig"]
+            lv = f"손절: {money(p['SL'])} (-{p['sl_pct']:.2f}%) · 익절: {money(p['TP'])} (+{p['tp_pct']:.2f}%)"
+            acct = f"계좌 {self.day_ret():+.2f}% · 모두 손절 시 -{self.expected_loss_pct():.2f}%"
+            if p["n_fills"] == 1:                         # 첫 체결: 신호 내용 + 텔레그램 버튼 (즉시 청산 / 절반 청산)
+                name = f" ({s['name']})" if s.get("name") else ""
+                self.alert(f"📈 매수 신호 → 모의 매수\n종목: {tk}{name}\n신호: {clk(t)}\n"
+                           f"체결: {q:,}주 @ {money(px)} (${q * px:,.0f}, 계좌의 {q * px / self.base() * 100:.1f}%){part}\n"
+                           f"{lv}\n눌림 저점 {money(p['L'])} · 당일 {s.get('chg', 0):+.0f}% · RVOL {s.get('rvol') or 0:.1f} · "
+                           f"점수 {s.get('score') or 0:.0f}\n{acct}",
+                           buttons=[[("❌ 즉시 청산", f"exit|{st['day']}|{tk}"), ("➖ 절반 청산", f"half|{st['day']}|{tk}")]])
+            else:
+                self.alert(f"🟢 추가 체결 {tk} {q:,}주 @ {money(px)}{part}\n평균 {money(p['avg'])} → {lv}\n{acct}")
         return q
 
     def sell(self, tk, raw_px, t, why, kind="market", cap=None):

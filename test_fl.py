@@ -383,6 +383,65 @@ class Simulation(unittest.TestCase):
         self.assertEqual(o["status"], "partial")
 
 
+class TelegramButtons(unittest.TestCase):
+    """체결 알림의 [즉시 청산] [절반 청산] 버튼 처리 (네트워크 없이)"""
+
+    def setUp(self):
+        import scanner
+        self.calls = []
+        self._api, self._conf = fl.tg_api, scanner.telegram_conf
+        fl.tg_api = lambda m, p, timeout=15: self.calls.append((m, p)) or {"ok": True}
+        scanner.telegram_conf = lambda: ("TOKEN", "123")
+        self.bot = fl.LiveFL(cfg0())
+        self.bot.acct = acct()
+        self.alerts = []
+        self.bot.acct.alert = lambda text, buttons=None: self.alerts.append((text, buttons))
+        o = self.bot.acct.submit(dict(sig("ABC"), name="Abc Corp", chg=30.0, rvol=8.0), T0, 2.0)
+        self.bot.acct.fill_buy(o, 2.0, T0)
+
+    def tearDown(self):
+        import scanner
+        fl.tg_api, scanner.telegram_conf = self._api, self._conf
+
+    def press(self, data, chat=123):
+        self.bot.handle_update({"update_id": 1, "callback_query": {"id": "q", "data": data,
+                                "message": {"message_id": 9, "chat": {"id": chat}}}}, T0 + MIN)
+
+    def test_fill_alert_has_buttons(self):
+        text, buttons = self.alerts[0]
+        self.assertIn("매수 신호", text)
+        self.assertIn("Abc Corp", text)
+        self.assertEqual([d for _, d in buttons[0]], [f"exit|{D}|ABC", f"half|{D}|ABC"])
+
+    def test_exit_button(self):
+        self.press(f"exit|{D}|ABC")
+        self.assertEqual(self.bot.acct.st["pos"]["ABC"]["exit_flag"], "수동 청산 (텔레그램 버튼)")
+        self.assertIn("answerCallbackQuery", [m for m, _ in self.calls])
+
+    def test_half_button(self):
+        q = self.bot.acct.st["pos"]["ABC"]["qty"]
+        self.press(f"half|{D}|ABC")
+        p = self.bot.acct.st["pos"]["ABC"]
+        self.assertEqual(p["manual_sell"], q // 2)
+        self.assertIsNone(p["exit_flag"])
+
+    def test_button_cancels_rest_of_buy(self):
+        a = self.bot.acct
+        o = a.submit(dict(sig("XYZ"), name=""), T0, 2.0)
+        a.fill_buy(o, 2.0, T0, cap=100)                                          # 부분 체결 중
+        self.press(f"half|{D}|XYZ")
+        self.assertEqual(o["status"], "partial")
+        self.assertEqual(a.open_buys(), [])
+
+    def test_other_chat_and_closed(self):
+        self.press(f"exit|{D}|ABC", chat=999)                                     # 다른 채팅방 -> 무시
+        self.assertIsNone(self.bot.acct.st["pos"]["ABC"]["exit_flag"])
+        self.assertEqual(self.calls, [])
+        self.press(f"exit|2026-11-23|ABC")                                        # 지난날 버튼 -> 처리 안 함
+        self.assertIsNone(self.bot.acct.st["pos"]["ABC"]["exit_flag"])
+        self.assertIn("이미 청산", self.calls[0][1]["text"])
+
+
 class Data(unittest.TestCase):
     def test_rvol_profile(self):
         """과거 10일 같은 시각 누적 거래량 평균 (5분 1천 주 -> 개장 30분 = 6천 주)"""

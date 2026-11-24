@@ -117,6 +117,37 @@ def get_spread(tk, quote=None):
     return None
 
 
+# ═════════════════════ 텔레그램 버튼 ═════════════════════
+def tg_api(method, params, timeout=15):
+    """텔레그램 봇 API (urllib). 토큰은 환경변수/알림설정.json 에서만 읽고 출력하지 않음. 실패하면 None"""
+    from scanner import _http, telegram_conf
+    token, _ = telegram_conf()
+    if not token:
+        return None
+    data = {k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v for k, v in params.items()}
+    try:
+        return json.loads(_http(f"https://api.telegram.org/bot{token}/{method}", data, timeout=timeout))
+    except Exception:
+        return None
+
+
+def markup(buttons):
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in buttons]}
+
+
+def ntfy_send(text, title):
+    from scanner import _http, load_alert
+    a = load_alert()
+    if not a.get("ntfy_topic"):
+        return False
+    try:
+        _http("https://ntfy.sh", json.dumps({"topic": a["ntfy_topic"], "title": title, "message": text}).encode("utf-8"),
+              {"Content-Type": "application/json"}, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
 def signal_cfg(cfg):
     """실시간 신호 모드: 계좌 한도·잠금 없이 모든 신호의 결과를 추적"""
     return dict(cfg, max_positions=10 ** 6, account_lock=False, participation_pct=None)
@@ -135,6 +166,7 @@ class LiveFL:
         self.last_min, self.next_scan, self.next_halt = None, None, None
         self.recent = collections.deque(maxlen=20)
         self.dry = False
+        self.tg_warned = False
         self.used = collections.Counter()          # (종목, 매수/매도, 분) -> 이번 1분에 이미 체결한 수량
 
     def budget(self, tk, bars, now, side):
@@ -159,11 +191,92 @@ class LiveFL:
             self.logf.write(line + "\n")
             self.logf.flush()
 
-    def say(self, text):
+    def say(self, text, buttons=None):
+        """알림: ntfy + 텔레그램. buttons = [[(글자, 콜백값), ...], ...] 이면 텔레그램 메시지에 버튼을 붙임"""
         if self.dry:
             return []
-        from scanner import notify
-        return notify(text, self.title)
+        from scanner import notify, telegram_conf
+        if not buttons:
+            return notify(text, self.title)
+        sent = ["ntfy"] if ntfy_send(text, self.title) else []
+        _, chat = telegram_conf()
+        r = tg_api("sendMessage", {"chat_id": chat, "text": f"[{self.title}] {text}", "reply_markup": markup(buttons)})
+        if r and r.get("ok"):
+            sent.append("텔레그램")
+        else:                                                          # 버튼 전송 실패 -> 버튼 없이라도
+            from scanner import send_telegram
+            if send_telegram(f"[{self.title}] {text}"):
+                sent.append("텔레그램")
+        return sent
+
+    # ── 텔레그램 버튼 응답 (모의투자 봇만, 10초마다) ──
+    def poll_telegram(self, now):
+        if self.sig or self.dry:
+            return
+        st = self.acct.st
+        if st.get("tg_offset") is None:                  # 처음: 지난 대화는 건너뜀
+            r = tg_api("getUpdates", {"offset": -1, "timeout": 0})
+            res = (r or {}).get("result") or []
+            st["tg_offset"] = res[-1]["update_id"] + 1 if res else 0
+            return
+        r = tg_api("getUpdates", {"offset": st["tg_offset"], "timeout": 0,
+                                  "allowed_updates": ["callback_query", "message"]})
+        if not r or not r.get("ok"):
+            if r and r.get("error_code") == 409 and not self.tg_warned:
+                self.tg_warned = True
+                self.log("텔레그램 버튼 응답 충돌: 같은 봇을 다른 프로그램이 읽고 있음 (PC 봇과 서버 봇이 같이 켜져 있는지 확인)")
+            return
+        for u in r.get("result", []):
+            st["tg_offset"] = u["update_id"] + 1
+            try:
+                self.handle_update(u, now)
+            except Exception as e:
+                self.log(f"텔레그램 응답 처리 오류: {type(e).__name__}: {e}")
+
+    def handle_update(self, u, now):
+        """버튼: exit|날짜|종목 = 즉시 전량 청산, half|날짜|종목 = 절반 청산. 메시지 '상태' = 현재 상태 답장
+        내 채팅방(알림설정의 chat id)에서 온 것만 처리"""
+        from scanner import telegram_conf
+        _, chat = telegram_conf()
+        st = self.acct.st
+        cq, msg = u.get("callback_query"), u.get("message")
+        if msg:
+            if str(msg.get("chat", {}).get("id")) == str(chat) and msg.get("text", "").strip() in ("상태", "/상태", "/status"):
+                held = "\n".join(f"• {tk} {p['qty']:,}주 평균 {money(p['avg'])} → {money(self.acct.px(tk))} "
+                                 f"({(self.acct.px(tk) / p['avg'] - 1) * 100:+.2f}%) 손절 {money(p['SL'])} 익절 {money(p['TP'])}"
+                                 for tk, p in st["pos"].items())
+                tg_api("sendMessage", {"chat_id": chat, "text": f"[{self.title}] 상태\n{self.status_line()}" + (f"\n{held}" if held else "")})
+            return
+        if not cq or str(cq.get("message", {}).get("chat", {}).get("id")) != str(chat):
+            return
+        parts = str(cq.get("data", "")).split("|")
+        mid = cq.get("message", {}).get("message_id")
+        if len(parts) != 3:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": "알 수 없는 버튼"})
+            return
+        act, day, tk = parts
+        p = st["pos"].get(tk) if day == st["day"] else None
+        if not p or p["qty"] <= 0:
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": f"{tk}: 이미 청산됐거나 오늘 보유 종목이 아닙니다"})
+            tg_api("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid, "reply_markup": {"inline_keyboard": []}})
+            return
+        for o in self.acct.open_buys():                       # 청산 버튼 = 그 종목 남은 매수 주문도 취소
+            if o["tk"] == tk:
+                o["status"] = "partial" if o["filled"] else "cancelled"
+                o["why"] = "텔레그램 청산 버튼"
+                self.log(f"{tk} 남은 매수 주문 취소 (텔레그램 청산 버튼) - 체결 {o['filled']}/{o['qty']}주")
+        half = p["qty"] // 2
+        if act == "half" and half >= 1 and not p["exit_flag"]:
+            p["manual_sell"] = p.get("manual_sell", 0) + half
+            note = f"{tk} {half:,}주 절반 청산 주문 (남은 {p['qty'] - half:,}주는 손절·익절 그대로)"
+            tg_api("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid,
+                                              "reply_markup": markup([[("❌ 나머지 즉시 청산", f"exit|{day}|{tk}")]])})
+        else:
+            p["exit_flag"] = "수동 청산 (텔레그램 버튼)"
+            note = f"{tk} {p['qty']:,}주 전량 청산 주문"
+            tg_api("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid, "reply_markup": {"inline_keyboard": []}})
+        tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": note})
+        self.log(f"텔레그램 버튼 → {note}")
 
     # ── 데이터 ──
     def fetch_1m(self, tks):
@@ -313,6 +426,7 @@ class LiveFL:
                 st.setdefault("shadow", []).append(dict(s, mode=kind, t_detect=iso(now)))
             return
         tk = s["tk"]
+        s["name"] = self.cands.get(tk, {}).get("name", "")
         q = self.quotes.get(tk)
         s["spread_pct"] = None if self.dry else get_spread(tk, q)
         s["spread_checked"] = True
@@ -371,6 +485,16 @@ class LiveFL:
             if p["exit_flag"]:
                 self.took(tk, "sell", now, acct.sell(tk, px, now, p["exit_flag"], "market",
                                                      self.budget(tk, bars, now, "sell")))
+                continue
+            if p.get("manual_sell"):                                   # 텔레그램 '절반 청산' 버튼
+                b = self.budget(tk, bars, now, "sell")
+                q = acct.sell(tk, px, now, "수동 절반 청산 (텔레그램 버튼)", "market",
+                              p["manual_sell"] if b is None else min(b, p["manual_sell"]))
+                self.took(tk, "sell", now, q)
+                if tk in st["pos"]:
+                    p["manual_sell"] -= q or 0
+                    if p["manual_sell"] <= 0:
+                        p.pop("manual_sell")
                 continue
             em = ts(p["entry_min"])
             r = None
@@ -591,6 +715,10 @@ th{{background:#222}}td:first-child{{text-align:left;font-weight:bold}}h2{{font-
         if bar != self.last_min:
             self.minute(now, W)
             self.last_min = bar
+        try:
+            self.poll_telegram(now)                                    # 버튼은 바로 다음 시세 확인에서 실행
+        except Exception as e:
+            self.log(f"텔레그램 확인 오류: {type(e).__name__}")
         self.hot(now, W)
         self.acct.expire_orders(now)
 
@@ -723,6 +851,42 @@ def premarket_alert(cfg, top=15):
     return "\n".join(lines)
 
 
+def tg_test(minutes=10):
+    """텔레그램 버튼 시험: 가짜 매수 알림(버튼 포함)을 보내고 minutes 분 동안 버튼 누름에 답함 (매매 없음)"""
+    from scanner import telegram_conf
+    _, chat = telegram_conf()
+    r = tg_api("getUpdates", {"offset": -1, "timeout": 0})
+    res = (r or {}).get("result") or []
+    off = res[-1]["update_id"] + 1 if res else 0
+    m = tg_api("sendMessage", {"chat_id": chat, "reply_markup": markup([[("❌ 즉시 청산", "exit|test|TEST"),
+                                                                          ("➖ 절반 청산", "half|test|TEST")]]),
+                               "text": "[FL 모의] 🧪 버튼 시험 (실제 매매 아님)\n📈 매수 신호 → 모의 매수\n종목: TEST (시험용)\n"
+                                       "체결: 1,000주 @ $2.00 ($2,000, 계좌의 20.0%)\n손절: $1.95 (-2.50%) · 익절: $2.15 (+7.50%)\n"
+                                       f"아래 버튼을 눌러 보세요 ({minutes}분 동안 응답)"})
+    print("시험 메시지:", "보냄" if m and m.get("ok") else "실패", flush=True)
+    end = time.time() + minutes * 60
+    while time.time() < end:
+        r = tg_api("getUpdates", {"offset": off, "timeout": 20, "allowed_updates": ["callback_query"]}, timeout=35)
+        for u in (r or {}).get("result") or []:
+            off = u["update_id"] + 1
+            cq = u.get("callback_query")
+            if not cq or str(cq.get("message", {}).get("chat", {}).get("id")) != str(chat):
+                continue
+            act = str(cq.get("data", "")).split("|")[0]
+            mid = cq["message"]["message_id"]
+            if act == "half":
+                note = "시험: 절반 청산 버튼 확인 → 실제로는 500주 청산 주문 (남은 500주는 손절·익절 그대로)"
+                tg_api("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid,
+                                                  "reply_markup": markup([[("❌ 나머지 즉시 청산", "exit|test|TEST")]])})
+            else:
+                note = "시험: 즉시 청산 버튼 확인 → 실제로는 남은 수량 전량 시장가 청산"
+                tg_api("editMessageReplyMarkup", {"chat_id": chat, "message_id": mid, "reply_markup": {"inline_keyboard": []}})
+            tg_api("answerCallbackQuery", {"callback_query_id": cq["id"], "text": note, "show_alert": True})
+            print("버튼 눌림:", act, flush=True)
+    tg_api("getUpdates", {"offset": off, "timeout": 0})
+    print("시험 끝", flush=True)
+
+
 def compare_ab(cfg):
     """모의 기록(state/fl_*.json)의 A 모드(실시간 교차 감지가)·B 모드(봉 마감 후 다음 봉 시가) 신호를 같은 청산 규칙으로"""
     import fl_backtest as bt
@@ -814,7 +978,11 @@ def main():
     ap.add_argument("--config", default=None)
     ap.add_argument("--until", default=None, help="뉴욕 HH:MM 에 상태 저장 후 종료 (GitHub 1부)")
     ap.add_argument("--resume", action="store_true", help="이어받기: 재시작 알림 안 보냄 (GitHub 2부)")
+    ap.add_argument("--tg-test", type=int, nargs="?", const=10, default=None, help="텔레그램 버튼 시험 (분)")
     a = ap.parse_args()
+    if a.tg_test:
+        tg_test(a.tg_test)
+        return
     cfg = load_config(a.config) if a.config else load_config()
     if a.backtest:
         import fl_backtest
