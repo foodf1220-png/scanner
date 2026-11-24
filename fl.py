@@ -833,6 +833,7 @@ def main():
         print(msg)
         if a.telegram:
             bot.dry = False
+            bot.title = "FL 테스트 검색"
             print("보낸 곳:", ", ".join(bot.say(msg)) or "없음")
     elif a.paper or a.live:
         LiveFL(cfg, signal=a.live, until=a.until, resume=a.resume).run()
