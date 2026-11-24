@@ -9,12 +9,17 @@ monitor.py - 승인된 종목 주문·체결 확인 (크론으로 1분마다). 5
       1주도 못 사면 '매수 불가' 텔레그램 + 저장소에서 삭제
       살 수 있으면 시장가 매수 -> PENDING(+order_id) 저장 -> '주문 접수' 텔레그램
   · PENDING: 토스 보유 내역으로 체결 확인 -> OPEN(+매수가·수량) 저장 + '체결 완료' 텔레그램. 아직이면 다음 실행 때
-  · OPEN: 손절·익절 (사용자 조건, FL): E = 실제 평균 체결가, L = 신호 때 눌림 저점(signal_low), D = E - L
-      손절 SL = E - D/3 (호가 올림), 익절 TP = E + D (호가 내림)  -> 토스 조건주문 2개 (문서 11번, 가격 도달 시 전량 시장가 매도)
-      체결 순간 이미 SL 아래 / TP 위 / E <= L 이면 조건주문 대신 즉시 시장가 매도 (문서 11번 방향 주의)
-      조건주문이 실행돼 보유가 0 이 되면: 두 조건주문 취소 시도 -> not-found 인 쪽이 실행된 것 -> 손절/익절 알림, 남은 주문 취소
-      뉴욕 15:50 (조기 폐장일 12:50) = 장 마감 10분 전: 남은 종목 시장가 매도 -> CLOSING -> 매도 확인 후 '청산 완료'
-        (시장가 매도 = POST /api/v1/orders side SELL: 문서에 예시 없음, 사용자 승인으로 사용)
+  · 체결 확인 -> 손절·익절 SINGLE 시장가 조건주문 2개 (문서 11번) 등록, ID 저장, OPEN
+      EXIT_MODE=fl (기본, 사용자 조건): E = 실제 평균 체결가, L = 신호 때 눌림 저점, D = E - L
+          손절 = E - D/3 + 수수료 0.2% (당김), 익절 = E + D + 수수료 0.2%
+      EXIT_MODE=pct (강의 예시): 손절 = 매수가 x (1 - 3% + 0.2%), 익절 = 매수가 x (1 + 5% + 0.2%)
+  · OPEN: 정규장이면 두 조건주문이 살아 있는지 조회 -> 없으면 재등록. 단 현재가가 이미 트리거를 넘었으면 즉시 시장가 매도
+          (방향이 반대로 등록될 위험). 정규장 밖이면 두 조건주문 모두 취소 (장 열리면 위 로직으로 재등록)
+          현재가 >= 매수가 +3% -> 손절 조건주문 취소 후 매수가 + 수수료 0.2% 로 다시 등록 -> BREAKEVEN
+  · BREAKEVEN: OPEN 과 같고 손절이 매수가(+수수료)로 고정
+  · 어느 상태든 보유 0 (조건주문 체결) -> 남은 조건주문 정리 (not-found 인 쪽 = 실행된 쪽) -> 포지션 삭제 -> 텔레그램
+  · 뉴욕 15:50 (조기 폐장일 12:50) = 장 마감 10분 전: 남은 종목 시장가 매도 -> CLOSING -> 매도 확인 후 '청산 완료'
+      (시장가 매도 = POST /api/v1/orders side SELL: 문서에 예시 없음, 사용자 승인으로 사용)
 [실제 주문 스위치] LIVE_ORDERS=true (bot.env) 일 때만 토스에 주문. 기본은 시험 모드 = 수량 계산·알림만 하고 승인 정리
 [안전장치 (강의 코드에 추가)]
   · 주문 직전 상태를 ORDERING 으로 바꿔 둠 -> 주문 후 저장 전에 꺼져도 다음 실행이 같은 종목을 또 사지 않음
@@ -51,6 +56,11 @@ LIVE_ORDERS        = os.environ.get("LIVE_ORDERS", "false").strip().lower() in (
 PENDING_ALERT_MIN  = 15            # 주문 후 이 시간이 지나도 체결 확인이 안 되면 1번 알림
 STOP_DIV           = 3.0           # 손절 = E - D / 3
 TARGET_MULT        = 1.0           # 익절 = E + D x 1
+EXIT_MODE          = os.environ.get("EXIT_MODE", "fl").strip().lower()   # fl = 눌림 저점 3:1 (사용자 조건) / pct = 강의 예시 %
+FEE_PCT            = float(os.environ.get("FEE_PCT", "0.2"))             # 손절은 이만큼 당기고, 익절·브레이크이븐은 더함
+SL_PCT             = float(os.environ.get("SL_PCT", "3"))                # pct 모드 손절 -3%
+TP_PCT             = float(os.environ.get("TP_PCT", "5"))                # pct 모드 익절 +5%
+BE_TRIGGER_PCT     = float(os.environ.get("BE_TRIGGER_PCT", "3"))        # 매수가 +3% 이상이면 손절을 매수가(+수수료)로
 FLATTEN_BEFORE_MIN = 10            # 장 마감 10분 전 청산
 COND_EXPIRE_DAYS   = 90            # 조건주문 유효기간 (문서: 등록일 + 90일 정도)
 
@@ -105,12 +115,27 @@ def fmt_px(p):
 
 
 def exit_levels(E, L):
-    """(손절, 익절) 또는 None (L 없음·체결가가 저점 이하)"""
-    if not L or E <= L:
-        return None
-    D = E - float(L)
-    SL, TP = round_tick(E - D / STOP_DIV, True), round_tick(E + D * TARGET_MULT, False)
+    """(손절, 익절) - 수수료 보정: 손절은 FEE_PCT 만큼 매수가 쪽으로 당기고, 익절은 더함
+    fl : 손절 = E - D/3 + 수수료, 익절 = E + D + 수수료 (D = E - 눌림 저점 L)
+    pct: 손절 = E x (1 - 3% + 0.2%), 익절 = E x (1 + 5% + 0.2%)
+    계산 불가(L 없음·체결가가 저점 이하)면 None"""
+    fee = E * FEE_PCT / 100
+    if EXIT_MODE == "pct":
+        sl_raw, tp_raw = E * (1 - SL_PCT / 100) + fee, E * (1 + TP_PCT / 100) + fee
+    else:
+        if not L or E <= float(L):
+            return None
+        D = E - float(L)
+        sl_raw, tp_raw = E - D / STOP_DIV + fee, E + D * TARGET_MULT + fee
+        if sl_raw >= E:                                    # 손절폭이 수수료보다 좁으면 당기지 않음
+            sl_raw = E - D / STOP_DIV
+    SL, TP = round_tick(sl_raw, True), round_tick(tp_raw, False)
     return (SL, TP) if SL < E < TP else None
+
+
+def breakeven_price(E):
+    """브레이크이븐 손절가 = 매수가 + 수수료 0.2%"""
+    return round_tick(E * (1 + FEE_PCT / 100), True)
 
 
 def send_message(chat_id, text):
@@ -213,6 +238,25 @@ def place_conditional_sell(token, account_seq, symbol, quantity, trigger):
                   {"symbol": symbol, "type": "SINGLE", "orderType": "MARKET", "quantity": str(int(quantity)),
                    "expireDate": expire, "first": {"orderSide": "SELL", "triggerPrice": fmt_px(trigger)}})
     return r["result"]["conditionalOrderId"]
+
+
+def conditional_alive(token, account_seq, cid):
+    """조건주문이 살아 있나: GET /api/v1/conditional-orders/{id} (문서 11번 '활성 여부 확인')
+    True = 조회됨, False = not-found(이미 실행·취소·만료, 문서 10번), None = 확인 실패(이번엔 건드리지 않음)"""
+    if not cid:
+        return False
+    try:
+        toss_get(f"/api/v1/conditional-orders/{cid}", token, account_seq)
+        return True
+    except urllib.error.HTTPError as e:
+        code, msg = _read_error(e)
+        if "not-found" in (code + msg) or e.code == 404:
+            return False
+        log(f"조건주문 {cid} 조회 오류 {e.code} {code}")
+        return None
+    except Exception as e:
+        log(f"조건주문 {cid} 조회 오류 {type(e).__name__}")
+        return None
 
 
 def cancel_conditional(token, account_seq, cid):
@@ -321,7 +365,7 @@ def handle_pending(token, symbol, pos):
     log(f"{symbol} 체결 완료 {filled:g}주 @ ${buy_price:.4f}")
     part = f" (주문 {ordered}주 중 일부)" if ordered and filled < ordered else ""
     send_message(pos["chat_id"], f"🔔 {b(symbol)} 체결 완료!\n\n매수가: ${buy_price:.2f} × {filled:g}주{part}")
-    setup_exits(token, symbol, dict(pos, status="OPEN", buy_price=round(buy_price, 4), quantity=filled))
+    manage_open(token, symbol, dict(pos, status="OPEN", buy_price=round(buy_price, 4), quantity=filled))
 
 
 # ── 손절·익절·장 마감 청산 ────────────────────────────────────────────────────
@@ -330,43 +374,88 @@ def pnl_text(E, px):
     return f"{(px / E - 1) * 100:+.2f}%" if E else ""
 
 
-def setup_exits(token, symbol, pos):
-    """체결 직후 (또는 조건주문 등록이 빠진 OPEN): 손절·익절 조건주문 등록. 이미 넘어섰으면 즉시 매도"""
+def manage_open(token, symbol, pos):
+    """OPEN / BREAKEVEN 관리 (체결 직후에도 바로 호출)
+    1) 보유 0 -> 정리·알림   2) 정규장 밖 -> 조건주문 전부 취소 (장 열리면 재등록)   3) 마감 10분 전 -> 시장가 청산
+    4) OPEN 이고 현재가 >= 매수가 +3% -> 손절 조건주문 취소 후 매수가(+수수료)로 다시 = BREAKEVEN
+    5) 손절·익절 조건주문이 없으면(not-found) 재등록. 단 현재가가 이미 트리거를 넘었으면 즉시 시장가 매도"""
     if not LIVE_ORDERS:
-        log(f"{symbol} 시험 모드 - 손절·익절 주문 안 함")
+        log(f"{symbol} 보유 중 (시험 모드 - 손절·익절 주문 안 함)")
         return
     acc, E, qty = pos["account_seq"], float(pos["buy_price"]), int(float(pos["quantity"]))
-    lv = exit_levels(E, pos.get("signal_low"))
-    if lv is None:
-        return start_close(token, symbol, pos, f"체결가 ${E:.2f} 가 눌림 저점 이하 (손절가 계산 불가) → 즉시 청산")
-    SL, TP = lv
-    price = get_current_price(token, symbol)
+    qty_now, _ = get_holding(token, acc, symbol)
+    if qty_now is None:
+        return
+    if qty_now - float(pos.get("base_qty") or 0) < 1:
+        return resolve_closed(token, symbol, pos)
+    if not is_market_open():
+        if pos.get("sl_id") or pos.get("tp_id"):
+            for k in ("sl_id", "tp_id"):
+                r = cancel_conditional(token, acc, pos.get(k))
+                if r.startswith("error"):
+                    log(f"{symbol} 정규장 외 조건주문 취소 오류 ({k}): {r}")
+            update_position(symbol, sl_id=None, tp_id=None)
+            log(f"{symbol} 정규장 외 - 손절·익절 조건주문 취소 (장이 열리면 다시 등록)")
+        else:
+            log(f"{symbol} 정규장 외 대기 (조건주문 없음)")
+        return
     if is_flatten_time():
         return start_close(token, symbol, pos, f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산")
-    if price <= SL:
-        return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 손절가 ${fmt_px(SL)} 이하 → 즉시 손절")
-    if price >= TP:
-        return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 익절가 ${fmt_px(TP)} 이상 → 즉시 익절")
-    ids, failed = {}, []
+
+    SL, TP = pos.get("SL"), pos.get("TP")
+    if SL is None or TP is None:
+        lv = exit_levels(E, pos.get("signal_low"))
+        if lv is None:
+            return start_close(token, symbol, pos, f"체결가 ${E:.2f} 가 눌림 저점 이하 (손절가 계산 불가) → 즉시 청산")
+        SL, TP = lv
+        update_position(symbol, SL=SL, TP=TP)
+        pos = dict(pos, SL=SL, TP=TP)
+    SL, TP = float(SL), float(TP)
+    price = get_current_price(token, symbol)
+
+    if pos["status"] == "OPEN" and price >= E * (1 + BE_TRIGGER_PCT / 100):           # 브레이크이븐
+        BE = breakeven_price(E)
+        if pos.get("sl_id"):
+            cancel_conditional(token, acc, pos["sl_id"])
+        update_position(symbol, status="BREAKEVEN", SL=BE, sl_id=None, be_at=now_iso())
+        pos = dict(pos, status="BREAKEVEN", SL=BE, sl_id=None)
+        log(f"{symbol} 브레이크이븐: 현재가 ${price:.2f} ({pnl_text(E, price)}) → 손절 ${fmt_px(SL)} → ${fmt_px(BE)}")
+        send_message(pos["chat_id"], f"🔒 {b(symbol)} 브레이크이븐\n\n현재가 ${price:.2f} ({pnl_text(E, price)}) - 매수가 +{BE_TRIGGER_PCT:g}% 도달\n"
+                                     f"손절을 ${fmt_px(SL)} → 매수가+수수료 ${fmt_px(BE)} 로 올렸어요. 익절 ${fmt_px(TP)} 은 그대로")
+        SL = BE
+
+    new, failed = {}, []
     for kind, trig in (("sl", SL), ("tp", TP)):
-        if pos.get(f"{kind}_id"):
+        alive = conditional_alive(token, acc, pos.get(f"{kind}_id"))
+        if alive or alive is None:                                   # 살아 있음 / 확인 실패면 이번엔 그대로
             continue
+        if kind == "sl" and price <= trig:                           # 방향이 반대로 등록될 위험 -> 즉시 매도
+            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 손절가 ${fmt_px(trig)} 이하 → 즉시 시장가 매도")
+        if kind == "tp" and price >= trig:
+            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 익절가 ${fmt_px(trig)} 이상 → 즉시 시장가 매도")
         try:
-            ids[f"{kind}_id"] = place_conditional_sell(token, acc, symbol, qty, trig)
+            new[f"{kind}_id"] = place_conditional_sell(token, acc, symbol, qty, trig)
         except Exception as e:
             code, msg = _read_error(e) if isinstance(e, urllib.error.HTTPError) else ("", str(e))
-            log(f"{symbol} {'손절' if kind == 'sl' else '익절'} 조건주문 실패: {code} {msg}")
+            log(f"{symbol} {'손절' if kind == 'sl' else '익절'} 조건주문 등록 실패: {code} {msg}")
             failed.append("손절" if kind == "sl" else "익절")
-    update_position(symbol, SL=SL, TP=TP, **ids)
-    log(f"{symbol} 조건주문 손절 ${fmt_px(SL)} / 익절 ${fmt_px(TP)} 등록" + (f" (실패: {', '.join(failed)} - 다음 실행 때 다시)" if failed else ""))
-    if not pos.get("exits_announced"):
+    if new:
+        update_position(symbol, **new)
+        log(f"{symbol} 조건주문 등록: " + ", ".join(f"{'손절' if k == 'sl_id' else '익절'} ${fmt_px(SL if k == 'sl_id' else TP)}" for k in new))
+    elif not failed:
+        log(f"{symbol} {pos['status']} - 손절 ${fmt_px(SL)} / 익절 ${fmt_px(TP)} 조건주문 유지 (현재가 ${price:.2f}, {pnl_text(E, price)})")
+    if not pos.get("exits_announced") and new:
         update_position(symbol, exits_announced=True)
         flat = close_time(datetime.now(ET)) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+        basis = (f"눌림 저점 ${fmt_px(float(pos['signal_low']))} 기준 3:1" if EXIT_MODE != "pct" else f"-{SL_PCT:g}% / +{TP_PCT:g}%")
         send_message(pos["chat_id"],
-                     f"🛡 {b(symbol)} 손절·익절 등록\n\n매수가 ${E:.2f} · 눌림 저점 ${fmt_px(float(pos['signal_low']))}\n"
+                     f"🛡 {b(symbol)} 손절·익절 등록 ({basis}, 수수료 {FEE_PCT:g}% 보정)\n\n매수가 ${E:.2f}\n"
                      f"손절 ${fmt_px(SL)} ({pnl_text(E, SL)}) · 익절 ${fmt_px(TP)} ({pnl_text(E, TP)})\n"
-                     f"둘 다 안 닿으면 뉴욕 {flat:%H:%M} (한국 {flat.astimezone(ZoneInfo('Asia/Seoul')):%H:%M}) 에 시장가 청산"
-                     + (f"\n⚠️ {', '.join(failed)} 조건주문 등록 실패 - 1분 뒤 다시 시도" if failed else ""))
+                     f"+{BE_TRIGGER_PCT:g}% 오르면 손절을 매수가+수수료로 올림 (브레이크이븐)\n"
+                     f"안 닿으면 뉴욕 {flat:%H:%M} (한국 {flat.astimezone(ZoneInfo('Asia/Seoul')):%H:%M}) 에 시장가 청산")
+    if failed and not pos.get("exits_fail_alerted"):
+        update_position(symbol, exits_fail_alerted=True)
+        send_message(pos["chat_id"], f"⚠️ {b(symbol)} {', '.join(failed)} 조건주문 등록 실패 - 1분마다 다시 시도해요")
 
 
 def start_close(token, symbol, pos, why):
@@ -417,7 +506,9 @@ def resolve_closed(token, symbol, pos):
     acc, E = pos["account_seq"], float(pos.get("buy_price") or 0)
     r = {k: cancel_conditional(token, acc, pos.get(f"{k}_id")) for k in ("sl", "tp")}
     if r["sl"] == "gone" and r["tp"] != "gone":
-        why, px, mark = "손절 실행 (조건주문)", float(pos.get("SL") or 0), "🔻"
+        be = pos.get("status") == "BREAKEVEN"
+        why, px, mark = ("브레이크이븐 손절 실행 (조건주문)" if be else "손절 실행 (조건주문)"), float(pos.get("SL") or 0), \
+            ("🟰" if be else "🔻")
     elif r["tp"] == "gone" and r["sl"] != "gone":
         why, px, mark = "익절 실행 (조건주문)", float(pos.get("TP") or 0), "✅"
     else:
@@ -430,22 +521,6 @@ def resolve_closed(token, symbol, pos):
     log(f"{symbol} {why} - 매수 ${E:.2f} → 약 ${px:.2f} (조건주문 취소 결과 {r})")
     send_message(pos["chat_id"], f"{mark} {b(symbol)} {html.escape(why)}\n\n매수 ${E:.2f} → 약 ${px:.2f} "
                                  f"({pnl_text(E, px)}, 수수료 전) × {float(pos.get('quantity') or 0):g}주\n남은 조건주문은 취소했어요.")
-
-
-def handle_open(token, symbol, pos):
-    if not LIVE_ORDERS:
-        log(f"{symbol} 보유 중 (시험 모드 - 청산 주문 안 함)")
-        return
-    qty_now, _ = get_holding(token, pos["account_seq"], symbol)
-    if qty_now is None:
-        return
-    if qty_now - float(pos.get("base_qty") or 0) < 1:
-        return resolve_closed(token, symbol, pos)
-    if is_flatten_time():
-        return start_close(token, symbol, pos, f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산")
-    if not (pos.get("sl_id") and pos.get("tp_id")):
-        return setup_exits(token, symbol, pos)
-    log(f"{symbol} 보유 중 - 손절 ${fmt_px(float(pos['SL']))} / 익절 ${fmt_px(float(pos['TP']))} 조건주문 대기")
 
 
 def handle_closing(token, symbol, pos):
@@ -516,8 +591,8 @@ def main():
                 handle_pending(token, symbol, pos)
             elif status == "ORDERING":
                 handle_ordering(symbol, pos)
-            elif status == "OPEN":
-                handle_open(token, symbol, pos)
+            elif status in ("OPEN", "BREAKEVEN"):
+                manage_open(token, symbol, pos)
             elif status == "CLOSING":
                 handle_closing(token, symbol, pos)
         except Exception as e:
