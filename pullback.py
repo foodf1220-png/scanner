@@ -5,7 +5,8 @@ pullback.py - 미국주식 C자리 눌림목 -> B자리(두 고점 사이 지지
 [C자리] 마감된 5분봉만 사용, 같은 거래일 안에서
   급등   최근 24개 완성봉 안에서 저점 -> 이후 다른 봉의 고가가 저가 대비 30% 이상 (가장 최근의 유효 급등 고점)
   눌림   급등 고점 이후 다른 봉의 저가가 고점 대비 20~40% 하락 -> 후보 (반등 확인 전 40% 초과 하락하면 취소)
-  C 알림 눌림 이후 첫 완성봉이 ① 양봉 ② 종가 > 직전 2봉 고가 ③ 224 EMA <= 종가 <= EMA x 1.05 (주문 없음)
+  C 알림 눌림 이후 첫 완성봉이 ① 양봉 ② 종가 > 직전 2봉 고가 ③ 224 EMA <= 종가 <= EMA x 1.05
+         ④ 종가 $0.5 이상 (설정 min_price, 사용자 추가)
 [B자리] C 알림 이후
   H1     C봉부터 최고가 추적, 처음으로 종가 < 직전 종가인 봉에서 그때까지의 최고가
   중간   H1 봉 이후 다른 봉의 저가가 H1 대비 3% 이상 하락
@@ -73,6 +74,7 @@ DEFAULTS = {
     "ema_min_bars": 224,
     "ema_band_pct": 5.0,
     "c_break_bars": 2,
+    "min_price": 0.5,
     "mid_pullback_pct": 3.0,
     "mid_break_rule": "cancel",
     "h2_band_pct": 1.0,
@@ -269,7 +271,8 @@ class Tracker:
                 P["pb_low"], P["pb_low_t"] = l, T[i]
             nb = cfg["c_break_bars"]
             if (i >= nb and c > o and all(c > bars[i - j][2] for j in range(1, nb + 1))
-                    and ema <= c <= ema * (1 + cfg["ema_band_pct"] / 100)):
+                    and ema <= c <= ema * (1 + cfg["ema_band_pct"] / 100)
+                    and c >= cfg.get("min_price", 0)):             # ④ C봉 종가 최소 주가 이상 (사용자 추가)
                 P.update(c_t=T[i], c_close=c, c_ema=float(ema), run_hi=h, run_hi_t=T[i])
                 self.ph = "H1"
                 emit("C", peak=P["peak"], peak_t=P["peak_t"], pb_low=P["pb_low"], pb_low_t=P["pb_low_t"],

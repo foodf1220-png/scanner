@@ -279,6 +279,15 @@ class C진입(unittest.TestCase):
             self.assertEqual(t["why"], why)
             self.assertAlmostEqual(t["target"], t["avg"] * (1.04 if why == "익절" else 0.94), places=6)
 
+    def test_주가_0점5달러_미만이면_C_매수신호_없음(self):
+        c = cfg_c()
+        self.assertEqual(c["min_price"], 0.5)
+        small = [tuple(round(x * 0.1, 4) for x in b) for b in BARS]          # 같은 모양, 가격만 1/10 (C봉 종가 $0.298)
+        core, alerts = new_core(c)
+        self.assertEqual(feed(core, "TEST", today5(make_raw(small, prior_px=0.285), c)), [])
+        core, alerts = new_core(c)                                           # 원래 가격($2.98)이면 그대로 나옴
+        self.assertEqual(len(feed(core, "TEST", today5(make_raw(BARS), c))), 1)
+
     def test_C진입_재시작_중복0(self):
         c = cfg_c()
         core, alerts = new_core(c)
