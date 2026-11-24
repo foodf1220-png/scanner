@@ -147,6 +147,12 @@ def clk(t):
     return f"{t.tz_convert(ET_S):%H:%M}ET({t.tz_convert(KST_S):%H:%M}KST)"
 
 
+def tpsl_text(cfg):
+    """익절·손절 표시: 같으면 ±7%, 다르면 +4/-7%"""
+    tp, sl = cfg["tp_pct"], cfg["sl_pct"]
+    return f"±{tp:g}%" if tp == sl else f"+{tp:g}/-{sl:g}%"
+
+
 def bar_td(cfg):
     return pd.Timedelta(minutes=cfg["bar_minutes"])
 
@@ -1186,7 +1192,7 @@ class LivePaper:
         active = {tk: names.get(t.ph, t.ph) for tk, t in core.trk.items() if t.ph != "IDLE"}
         lines = [f"🔎 눌림목 한 번 검색 ({d} 미국 장, {clk(now)} 까지 마감된 5분봉)",
                  f"검색 범위: {self.coverage_text()}",
-                 (f"C 매수 신호 {sum(r['type'] == 'C' for r in ev)}건 (C 봉에서 바로 진입, ±{cfg['tp_pct']:g}% · "
+                 (f"C 매수 신호 {sum(r['type'] == 'C' for r in ev)}건 (C 봉에서 바로 진입, 익절·손절 {tpsl_text(cfg)} · "
                   f"{cfg.get('max_hold_min') or '-'}분 · {clk(session_times(d, cfg)[2])} 청산)" if core.entry_type == "C" else
                   f"C 알림 {sum(r['type'] == 'C' for r in ev)}건 · B 신호 {sum(r['type'] == 'B' for r in ev)}건")]
         for r in ev:
@@ -1531,7 +1537,7 @@ def premarket_alert(cfg, top=15):
         lines.append("조건에 맞는 종목 없음")
     how = "C자리(눌림 후 첫 반등 봉)에서 매수 신호" if cfg.get("entry_signal", "B") == "C" else "C 알림, B자리에서 매수 신호"
     lines.append(f"정규장 {clk(at(d, cfg['regular_start_et']))}부터 5분봉으로 급등 → 20~40% 눌림 → {how} "
-                 f"(청산 ±{cfg['tp_pct']:g}% · 진입 {cfg.get('max_hold_min') or '-'}분 뒤 · {clk(flat)} 전량)")
+                 f"(청산 {tpsl_text(cfg)} · 진입 {cfg.get('max_hold_min') or '-'}분 뒤 · {clk(flat)} 전량)")
     return "\n".join(lines)
 
 
