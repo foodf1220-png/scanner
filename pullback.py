@@ -17,7 +17,7 @@ pullback.py - 미국주식 C자리 눌림목 -> B자리(두 고점 사이 지지
 [매매] 진입 신호봉(설정 entry_signal: 지금은 C, 원안은 B) 마감 후 실제 주문 가능한 다음 시세로 모의 매수
   (신호봉 종가 체결 가정 안 함). entry_signal = C 면 C 봉에서 바로 사고 B자리는 추적하지 않음
   종목당 당일 시작 순자산 25%, 미체결 포함 동시 최대 4종목, 동일 종목 추가매수 금지
-  종목 평균 매수가 ±4% 익절·손절 (원안 ±7%) / 진입 30분 뒤 청산 / 한국 02:30 전량 청산 후 종료
+  종목 평균 매수가 +4% 익절 / -6% 손절 (원안 ±7%) / 진입 30분 뒤 청산 / 한국 02:30 전량 청산 후 종료
   계좌 당일 +3% / -3% 처음 도달 -> 거래 잠금, 미체결 취소, 전량 청산, 다음 거래일까지 신규 진입 없음
 [실행]
   python pullback.py --paper      실시간 모의매매 (눌림목_모의투자.bat)
@@ -83,7 +83,7 @@ DEFAULTS = {
     "position_pct": 25.0,
     "max_positions": 4,
     "tp_pct": 4.0,
-    "sl_pct": 4.0,
+    "sl_pct": 6.0,
     "tp_mode": "pct",
     "account_target_pct": 3.0,
     "account_stop_pct": 3.0,
@@ -1353,7 +1353,8 @@ def backtest(cfg, ndays=None, use_cache=True):
     ent = cfg.get("entry_signal", "B")
     B = [e for e in events if e["type"] == ent]                   # 진입 신호 (C 봉 또는 B 봉)
     sig_name = "C 매수 신호" if ent == "C" else "B 신호"
-    tp_name = f"기본 ±{cfg['tp_pct']:g}%"
+    tp_name = (f"기본 ±{cfg['tp_pct']:g}%" if cfg["tp_pct"] == cfg["sl_pct"]
+               else f"기본 +{cfg['tp_pct']:g}/-{cfg['sl_pct']:g}%")
     strats = [("pct", tp_name)] + ([("h1", "비교 익절=H1")] if ent == "B" else [])
     P(f"  5분봉 확인 {n_td - skip['5분봉 없음']}건 | " + (", ".join(f"{k} {v}" for k, v in skip.items()) or ""))
     stage = collections.defaultdict(set)

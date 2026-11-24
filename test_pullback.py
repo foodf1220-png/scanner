@@ -62,7 +62,7 @@ def cfg():
 
 
 def cfg_c():
-    return copy.deepcopy(pb.DEFAULTS)          # 지금 설정: C 봉에서 바로 매수, ±4%, 30분
+    return copy.deepcopy(pb.DEFAULTS)          # 지금 설정: C 봉에서 바로 매수, +4% / -6%, 30분
 
 
 def today5(raw, c):
@@ -233,11 +233,11 @@ class 검증사례(unittest.TestCase):
 
 
 class C진입(unittest.TestCase):
-    """사용자 변경: C 알림 봉에서 바로 매수, ±4%, 진입 30분 뒤 청산"""
+    """사용자 변경: C 알림 봉에서 바로 매수, 익절 +4% / 손절 -6%, 진입 30분 뒤 청산"""
 
     def test_C봉에서_매수신호_1회_주문_1회_B추적_안함(self):
         c = cfg_c()
-        self.assertEqual((c["entry_signal"], c["tp_pct"], c["sl_pct"], c["max_hold_min"]), ("C", 4.0, 4.0, 30))
+        self.assertEqual((c["entry_signal"], c["tp_pct"], c["sl_pct"], c["max_hold_min"]), ("C", 4.0, 6.0, 30))
         core, alerts = new_core(c)
         d5 = today5(make_raw(BARS), c)
         ents = feed(core, "TEST", d5)
@@ -252,7 +252,7 @@ class C진입(unittest.TestCase):
         core.on_minute(pd.Timestamp(e["t_end"]), {"TEST": (2.98, 2.99, 2.97, 2.99)}, "close")
         p = core.st["pos"]["TEST"]
         self.assertAlmostEqual(p["tp"], p["avg"] * 1.04)
-        self.assertAlmostEqual(p["sl"], p["avg"] * 0.96)
+        self.assertAlmostEqual(p["sl"], p["avg"] * 0.94)
         self.assertIsNone(p["to_h1"])
 
     def test_C진입_30분_지나면_청산_29분은_보유(self):
@@ -260,20 +260,24 @@ class C진입(unittest.TestCase):
         core = pb.Core(c, dict(day=DAY, start_eq=10000.0, cash=10000.0), mode="cons")
         core.submit_b(dict(fake_b("AAA"), type="C", h1=None, peak=1.3, pb_low=0.98, pb_pct=24.6, ema=0.97), T_FILL, 1.0, T_FILL)
         core.on_minute(T_FILL, {"AAA": (1.0,) * 4}, "open")
-        core.on_minute(T_FILL + pd.Timedelta(minutes=29), {"AAA": (1.01, 1.03, 0.97, 1.02)}, "open")   # ±4% 안
+        core.on_minute(T_FILL + pd.Timedelta(minutes=29), {"AAA": (1.01, 1.03, 0.95, 1.02)}, "open")   # +4% · -6% 안
         self.assertIn("AAA", core.st["pos"])
         core.on_minute(T_FILL + pd.Timedelta(minutes=30), {"AAA": (1.02, 1.03, 1.01, 1.02)}, "open")
         self.assertEqual(core.st["trades"][0]["why"], "보유 30분 청산")
 
-    def test_C진입_4퍼_익절_손절(self):
-        for row, why in (((1.0, 1.05, 0.99, 1.04), "익절"), ((1.0, 1.01, 0.95, 0.96), "손절")):
+    def test_C진입_익절4_손절6(self):
+        for row, why in (((1.0, 1.05, 0.99, 1.04), "익절"), ((1.0, 1.01, 0.95, 0.96), "보유"), ((1.0, 1.01, 0.93, 0.95), "손절")):
             core = pb.Core(cfg_c(), dict(day=DAY, start_eq=10000.0, cash=10000.0), mode="cons")
             core.submit_b(dict(fake_b("AAA"), type="C", h1=None, peak=1.3, pb_low=0.98, pb_pct=24.6, ema=0.97), T_FILL, 1.0, T_FILL)
             core.on_minute(T_FILL, {"AAA": (1.0,) * 4}, "open")
             core.on_minute(T_FILL + pd.Timedelta(minutes=5), {"AAA": row}, "open")
+            if why == "보유":                                   # -5% 는 손절(-6%) 전이라 계속 보유
+                self.assertIn("AAA", core.st["pos"])
+                self.assertEqual(core.st["trades"], [])
+                continue
             t = core.st["trades"][0]
             self.assertEqual(t["why"], why)
-            self.assertAlmostEqual(t["target"], t["avg"] * (1.04 if why == "익절" else 0.96), places=6)
+            self.assertAlmostEqual(t["target"], t["avg"] * (1.04 if why == "익절" else 0.94), places=6)
 
     def test_C진입_재시작_중복0(self):
         c = cfg_c()
