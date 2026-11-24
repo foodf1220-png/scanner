@@ -8,6 +8,7 @@ node_modules/
 
 # 실행 기록, 임시 파일
 logs/
+state/
 cache/
 __pycache__/
 *.pyc
