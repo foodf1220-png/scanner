@@ -57,7 +57,12 @@ def make_raw(bars, prior=True, prior_px=2.85):
 
 
 def cfg():
-    return copy.deepcopy(pb.DEFAULTS)
+    """요청서 원안 (C 알림만 -> B 매수, ±7%, 60분) 으로 검증. C 진입·±4%·30분은 C진입 테스트에서 따로"""
+    return dict(copy.deepcopy(pb.DEFAULTS), entry_signal="B", tp_pct=7.0, sl_pct=7.0, max_hold_min=60)
+
+
+def cfg_c():
+    return copy.deepcopy(pb.DEFAULTS)          # 지금 설정: C 봉에서 바로 매수, ±4%, 30분
 
 
 def today5(raw, c):
@@ -225,6 +230,63 @@ class 검증사례(unittest.TestCase):
         self.assertEqual(len(core2.st["trades"]), 1)
         self.assertEqual(core2.st["trades"][0]["why"], "익절")
         self.assertEqual(sum(a.startswith("✅ 매도") for a in alerts), 1)
+
+
+class C진입(unittest.TestCase):
+    """사용자 변경: C 알림 봉에서 바로 매수, ±4%, 진입 30분 뒤 청산"""
+
+    def test_C봉에서_매수신호_1회_주문_1회_B추적_안함(self):
+        c = cfg_c()
+        self.assertEqual((c["entry_signal"], c["tp_pct"], c["sl_pct"], c["max_hold_min"]), ("C", 4.0, 4.0, 30))
+        core, alerts = new_core(c)
+        d5 = today5(make_raw(BARS), c)
+        ents = feed(core, "TEST", d5)
+        self.assertEqual([e["type"] for e in ents], ["C"])
+        e = ents[0]
+        self.assertEqual(pd.Timestamp(e["t"]).strftime("%H:%M"), "10:45")
+        self.assertEqual((e["peak"], e["pb_low"], e["close"]), (4.00, 2.80, 2.98))
+        self.assertIsNotNone(core.submit_b(e, pd.Timestamp(e["t_end"]), e["close"], pd.Timestamp(e["t_end"])))
+        self.assertEqual(sum(a.startswith("🟡 C 매수 신호") for a in alerts), 1)
+        self.assertFalse(any(r["type"] in ("H1", "H2", "RE", "B") for r in core.st["rows"]))   # B자리 추적 안 함
+        self.assertEqual(sum(r["type"] == "C" for r in core.st["rows"]), 1)                  # 기록도 1줄
+        core.on_minute(pd.Timestamp(e["t_end"]), {"TEST": (2.98, 2.99, 2.97, 2.99)}, "close")
+        p = core.st["pos"]["TEST"]
+        self.assertAlmostEqual(p["tp"], p["avg"] * 1.04)
+        self.assertAlmostEqual(p["sl"], p["avg"] * 0.96)
+        self.assertIsNone(p["to_h1"])
+
+    def test_C진입_30분_지나면_청산_29분은_보유(self):
+        c = cfg_c()
+        core = pb.Core(c, dict(day=DAY, start_eq=10000.0, cash=10000.0), mode="cons")
+        core.submit_b(dict(fake_b("AAA"), type="C", h1=None, peak=1.3, pb_low=0.98, pb_pct=24.6, ema=0.97), T_FILL, 1.0, T_FILL)
+        core.on_minute(T_FILL, {"AAA": (1.0,) * 4}, "open")
+        core.on_minute(T_FILL + pd.Timedelta(minutes=29), {"AAA": (1.01, 1.03, 0.97, 1.02)}, "open")   # ±4% 안
+        self.assertIn("AAA", core.st["pos"])
+        core.on_minute(T_FILL + pd.Timedelta(minutes=30), {"AAA": (1.02, 1.03, 1.01, 1.02)}, "open")
+        self.assertEqual(core.st["trades"][0]["why"], "보유 30분 청산")
+
+    def test_C진입_4퍼_익절_손절(self):
+        for row, why in (((1.0, 1.05, 0.99, 1.04), "익절"), ((1.0, 1.01, 0.95, 0.96), "손절")):
+            core = pb.Core(cfg_c(), dict(day=DAY, start_eq=10000.0, cash=10000.0), mode="cons")
+            core.submit_b(dict(fake_b("AAA"), type="C", h1=None, peak=1.3, pb_low=0.98, pb_pct=24.6, ema=0.97), T_FILL, 1.0, T_FILL)
+            core.on_minute(T_FILL, {"AAA": (1.0,) * 4}, "open")
+            core.on_minute(T_FILL + pd.Timedelta(minutes=5), {"AAA": row}, "open")
+            t = core.st["trades"][0]
+            self.assertEqual(t["why"], why)
+            self.assertAlmostEqual(t["target"], t["avg"] * (1.04 if why == "익절" else 0.96), places=6)
+
+    def test_C진입_재시작_중복0(self):
+        c = cfg_c()
+        core, alerts = new_core(c)
+        d5 = today5(make_raw(BARS), c)
+        e = feed(core, "TEST", d5)[0]
+        core.submit_b(e, pd.Timestamp(e["t_end"]), e["close"], pd.Timestamp(e["t_end"]))
+        n = len(alerts)
+        core2 = pb.Core(c, json.loads(json.dumps(core.snapshot(), default=str)), alert=alerts.append, mode="live")
+        self.assertEqual(core2.process_5m("TEST", d5, None), [])
+        self.assertIsNone(core2.submit_b(dict(e), pd.Timestamp(e["t_end"]), e["close"], pd.Timestamp(e["t_end"])))
+        self.assertEqual(len(alerts), n)
+        self.assertEqual(len(core2.st["orders"]), 1)
 
 
 class 경계사례(unittest.TestCase):

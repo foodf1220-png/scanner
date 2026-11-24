@@ -14,9 +14,10 @@ pullback.py - 미국주식 C자리 눌림목 -> B자리(두 고점 사이 지지
   재접근 H2 확정 다음 봉부터 저가가 S ±1% 에 처음 들어온 봉
   B 신호 재접근 봉 또는 다음 2봉 중 첫 봉이 ① 양봉 ② 종가 > 직전 종가 ③ 종가 > S
   취소   H2 확정 후 종가 < S / 재접근 후 2봉 안에 반등 없음 / C 후 24봉 안에 B 없음 / 거래일 끝
-[매매] B 신호봉 마감 후 실제 주문 가능한 다음 시세로 모의 매수 (신호봉 종가 체결 가정 안 함)
+[매매] 진입 신호봉(설정 entry_signal: 지금은 C, 원안은 B) 마감 후 실제 주문 가능한 다음 시세로 모의 매수
+  (신호봉 종가 체결 가정 안 함). entry_signal = C 면 C 봉에서 바로 사고 B자리는 추적하지 않음
   종목당 당일 시작 순자산 25%, 미체결 포함 동시 최대 4종목, 동일 종목 추가매수 금지
-  종목 평균 매수가 x1.07 익절 / x0.93 손절 / 진입 60분 뒤 청산 / 한국 02:30 전량 청산 후 종료
+  종목 평균 매수가 ±4% 익절·손절 (원안 ±7%) / 진입 30분 뒤 청산 / 한국 02:30 전량 청산 후 종료
   계좌 당일 +3% / -3% 처음 도달 -> 거래 잠금, 미체결 취소, 전량 청산, 다음 거래일까지 신규 진입 없음
 [실행]
   python pullback.py --paper      실시간 모의매매 (눌림목_모의투자.bat)
@@ -60,7 +61,8 @@ DEFAULTS = {
     "flatten_before_end_min": 5,
     "force_exit_kst": "02:30",
     "force_exit_et": None,
-    "max_hold_min": 60,
+    "entry_signal": "C",
+    "max_hold_min": 30,
     "premarket_alert_pct": 20.0,
     "bar_minutes": 5,
     "surge_lookback_bars": 24,
@@ -80,8 +82,8 @@ DEFAULTS = {
     "premarket_volume_filter": {"enabled": False, "min": 100000, "max": 1000000},
     "position_pct": 25.0,
     "max_positions": 4,
-    "tp_pct": 7.0,
-    "sl_pct": 7.0,
+    "tp_pct": 4.0,
+    "sl_pct": 4.0,
     "tp_mode": "pct",
     "account_target_pct": 3.0,
     "account_stop_pct": 3.0,
@@ -271,7 +273,9 @@ class Tracker:
                 P.update(c_t=T[i], c_close=c, c_ema=float(ema), run_hi=h, run_hi_t=T[i])
                 self.ph = "H1"
                 emit("C", peak=P["peak"], peak_t=P["peak_t"], pb_low=P["pb_low"], pb_low_t=P["pb_low_t"],
-                     pb_pct=(1 - P["pb_low"] / P["peak"]) * 100, ema=float(ema), close=c)
+                     pb_pct=(1 - P["pb_low"] / P["peak"]) * 100, ema=float(ema), close=c, h1=None)
+                if cfg.get("entry_signal", "B") == "C":         # C 봉에서 바로 진입 -> B자리 추적 안 함
+                    self.ph, self.p = "IDLE", {}
             return ev
 
         # ── C 이후 ──
@@ -377,6 +381,7 @@ class Core:
     def __init__(self, cfg, st, log=None, alert=None, mode="live", on_save=None):
         self.c, self.st, self.mode = cfg, st, mode
         self.sig = bool(cfg.get("signal_mode"))          # 실시간 신호 모드 (GitHub): 칸·계좌 제한 없이 모든 신호 안내
+        self.entry_type = cfg.get("entry_signal", "B")   # 진입 신호: "C" (C 봉에서 바로) / "B" (요청서 원안)
         self.log = log or (lambda m: None)
         self.alert, self.on_save = alert, on_save
         defaults = dict(pos={}, orders={}, trk={}, sent=[], entered=[], rows=[], trades=[], last1m={}, prices={},
@@ -453,7 +458,7 @@ class Core:
             for e in evs:
                 e["fresh"], e["t_end"] = fresh, iso(bars[i][0] + bt)
                 self._event(e)
-                if e["type"] == "B":
+                if e["type"] == self.entry_type:
                     out.append(e)
         return out
 
@@ -481,6 +486,9 @@ class Core:
             st["rows"].append(dict(e))
         elif k == "C":
             st["n_c"] += 1
+            if self.entry_type == "C":                    # C 진입: 기록·알림은 주문 단계에서 (주문 결과 포함)
+                self.log(f"C 매수 신호 {tk} {clk(e['t'])} 종가 {money(e['close'])} (눌림 -{e['pb_pct']:.1f}%, EMA {money(e['ema'])})")
+                return
             row = dict(e)
             st["rows"].append(row)
             msg = (f"🟡 C 알림 {tk} {clk(e['t'])} 5분봉 마감\n"
@@ -534,7 +542,7 @@ class Core:
                                      reserved=qty * ref * (1 + self.slip()) * (1 + self.fee()), status="NEW",
                                      created=iso(now), not_before=iso(not_before),
                                      deadline=iso(ts(not_before) + pd.Timedelta(minutes=c["buy_timeout_min"])),
-                                     h1=e["h1"], signal_t=e["t"], seq=st["seq"])
+                                     h1=e.get("h1"), signal_t=e["t"], seq=st["seq"])
             st["entered"].append(pid)
         result = f"모의 매수 주문 {qty}주 (약 ${qty * ref:,.0f})" if why is None else f"주문 안 함: {why}"
         if self.sig and why is None:
@@ -542,12 +550,17 @@ class Core:
                       + (f" / {c['max_hold_min']:g}분 뒤 청산" if c.get("max_hold_min") else "")
                       + (f" / 한국 {c['force_exit_kst']} 전량 청산" if c.get("force_exit_kst") else ""))
         st["rows"].append(dict(e, result=result, order_id=oid))
-        msg = (f"🔔 B 신호 {tk} {clk(e['t'])} 5분봉 마감\n"
-               f"H1 {money(e['h1'])} / H2 {money(e['h2'])} / 지지선 S {money(e['S'])}\n"
-               f"재접근 저가 {money(e['re_low'])} | B봉 종가 {money(e['close'])}\n→ {result}")
+        if e["type"] == "C":
+            msg = (f"🟡 C 매수 신호 {tk} {clk(e['t'])} 5분봉 마감\n"
+                   f"급등 고점 {money(e['peak'])} → 눌림 저점 {money(e['pb_low'])} (-{e['pb_pct']:.1f}%)\n"
+                   f"224 EMA {money(e['ema'])} | C봉 종가 {money(e['close'])}\n→ {result}")
+        else:
+            msg = (f"🔔 B 신호 {tk} {clk(e['t'])} 5분봉 마감\n"
+                   f"H1 {money(e['h1'])} / H2 {money(e['h2'])} / 지지선 S {money(e['S'])}\n"
+                   f"재접근 저가 {money(e['re_low'])} | B봉 종가 {money(e['close'])}\n→ {result}")
         self.log(msg.replace("\n", " | "))
         if e.get("fresh", True):
-            self.say_once(f"B|{pid}", msg)
+            self.say_once(f"{e['type']}|{pid}", msg)
         return oid
 
     # ── 1분 시세 ──
@@ -601,7 +614,7 @@ class Core:
     def _fill(self, o, raw_px, T, fill_field):
         st, c = self.st, self.c
         px = raw_px * (1 + self.slip())
-        if c.get("tp_mode") == "h1" and o["h1"] <= px:
+        if c.get("tp_mode") == "h1" and (not o.get("h1") or o["h1"] <= px):
             st["missed"].setdefault("h1_na", 0)
             st["missed"]["h1_na"] += 1
             self._cancel(o, f"비교 불가: H1 {money(o['h1'])} <= 진입가 {money(px)}")
@@ -617,12 +630,16 @@ class Core:
         tp = o["h1"] if c.get("tp_mode") == "h1" else px * (1 + c["tp_pct"] / 100)
         p = dict(tk=o["tk"], pid=o["pid"], oid=o["id"], qty=qty, avg=px, cost=cost, tp=tp,
                  sl=px * (1 - c["sl_pct"] / 100), entry_t=iso(T), entry_min=iso(ts(T).floor("min")),
-                 entry_field=fill_field, h1=o["h1"], to_h1=(o["h1"] / px - 1) * 100, signal_t=o["signal_t"])
+                 entry_field=fill_field, h1=o.get("h1"), to_h1=(o["h1"] / px - 1) * 100 if o.get("h1") else None,
+                 signal_t=o["signal_t"])
         st["pos"][o["tk"]] = p
         st["prices"][o["tk"]] = px
+        hold = c.get("max_hold_min")
         msg = (f"🟢 매수 체결 {o['tk']} {money(px)} x {qty}주 ({clk(T)})\n"
-               f"H1까지 {p['to_h1']:+.1f}% | 익절 {money(p['tp'])} / 손절 {money(p['sl'])} | "
-               f"보유 {len(st['pos'])}/{c['max_positions']}")
+               + (f"H1까지 {p['to_h1']:+.1f}% | " if p["to_h1"] is not None else "")
+               + f"익절 {money(p['tp'])} / 손절 {money(p['sl'])}"
+               + (f" / {clk(ts(T) + pd.Timedelta(minutes=hold))} 시간 청산" if hold else "")
+               + f" | 보유 {len(st['pos'])}/{c['max_positions']}")
         self.log(msg.replace("\n", " | "))
         if not self.sig:                                    # 신호 모드는 B 신호 알림에 이미 안내함
             self.say_once(f"F|{o['id']}", msg)
@@ -660,7 +677,8 @@ class Core:
         st["cash"] += proceeds
         net = proceeds - p["cost"]
         tr = dict(day=st["day"], tk=tk, pid=p["pid"], order_id=p["oid"], signal_t=p["signal_t"], entry_t=p["entry_t"],
-                  qty=p["qty"], avg=round(p["avg"], 6), h1=p["h1"], to_h1_pct=round(p["to_h1"], 2),
+                  qty=p["qty"], avg=round(p["avg"], 6), h1=p["h1"],
+                  to_h1_pct=round(p["to_h1"], 2) if p["to_h1"] is not None else None,
                   tp=round(p["tp"], 6), sl=round(p["sl"], 6), exit_t=iso(T), why=why,
                   target=None if target is None else round(target, 6), trigger=round(trigger, 6),
                   exit_px=round(px, 6), net_usd=round(net, 2), net_pct=round(net / p["cost"] * 100, 3), amb=amb)
@@ -1095,12 +1113,14 @@ class LivePaper:
                     rule = (f"익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}%"
                             + (f" / 진입 {cfg['max_hold_min']:g}분 뒤 청산" if cfg.get("max_hold_min") else "")
                             + f" / {clk(flat)} 전량 청산")
+                    how = ("C자리(눌림 후 첫 반등 봉) 마감 → 바로 매수" if core.entry_type == "C"
+                           else "C 알림은 주문 없이 추적, B자리에서 매수")
                     if self.sig:
                         self.say(f"📡 눌림목 실시간 신호 감시 시작 ({d} 미국 장)\n검색: {self.coverage_text()}\n"
-                                 f"5분봉 마감마다 전 종목 확인 → C 알림(주문 없음) · B 매수 신호 즉시 전송\n{rule}")
+                                 f"5분봉 마감마다 전 종목 확인 | {how} 신호 즉시 전송\n{rule}")
                     else:
                         self.say(f"📡 눌림목 모의매매 시작 ({d} 미국 장, {sess})\n검색: {self.coverage_text()}\n"
-                                 f"C 알림은 주문 없이 추적, B 신호에서만 모의 매수 | 종목당 {cfg['position_pct']:g}% · "
+                                 f"{how} | 종목당 {cfg['position_pct']:g}% · "
                                  f"최대 {cfg['max_positions']}종목 · 계좌 ±{cfg['account_target_pct']:g}% 잠금\n{rule}")
                 nxt = now.floor(f"{cfg['bar_minutes']}min") + bar_td(cfg)
                 next_scan = nxt + pd.Timedelta(seconds=cfg["bar_grace_sec"])
@@ -1116,7 +1136,8 @@ class LivePaper:
         trades = st["trades"]
         wins = sum(1 for t in trades if t["net_pct"] > 0)
         if self.sig:
-            lines = [f"📋 오늘 눌림목 신호 정리 ({d})", f"C 알림 {st['n_c']}건 · B 매수 신호 {st['n_b']}건"]
+            lines = [f"📋 오늘 눌림목 신호 정리 ({d})",
+                     f"{core.entry_type} 매수 신호 {st['n_b']}건" + (f" (C 알림 {st['n_c']}건)" if core.entry_type == "B" else "")]
             for t in trades:
                 lines.append(f"• {t['tk']} {clk(t['entry_t'])} 진입 {money(t['avg'])} → {t['why']} {money(t['exit_px'])} "
                              f"({t['net_pct']:+.2f}%)")
@@ -1131,7 +1152,7 @@ class LivePaper:
         eq = core.equity()
         lock = st["locked"]
         msg = (f"📊 오늘 결과 ({d})\n거래 {len(trades)}건 (이익 {wins}) | 계좌 {ret:+.2f}% (${eq - st['start_eq']:+,.2f})\n"
-               f"C 알림 {st['n_c']}건 · B 신호 {st['n_b']}건 (보유 한도로 놓침 {st['missed']['slots']}, 잠금 후 {st['missed']['lock']})\n"
+               f"{core.entry_type} 매수 신호 {st['n_b']}건 (보유 한도로 놓침 {st['missed']['slots']}, 잠금 후 {st['missed']['lock']})\n"
                f"계좌 기준: {lock['why'] if lock else '±3% 미도달'}")
         self.log(msg.replace("\n", " | "))
         core.say_once(f"END|{d}", msg)
@@ -1162,7 +1183,9 @@ class LivePaper:
         active = {tk: names.get(t.ph, t.ph) for tk, t in core.trk.items() if t.ph != "IDLE"}
         lines = [f"🔎 눌림목 한 번 검색 ({d} 미국 장, {clk(now)} 까지 마감된 5분봉)",
                  f"검색 범위: {self.coverage_text()}",
-                 f"C 알림 {sum(r['type'] == 'C' for r in ev)}건 · B 신호 {sum(r['type'] == 'B' for r in ev)}건"]
+                 (f"C 매수 신호 {sum(r['type'] == 'C' for r in ev)}건 (C 봉에서 바로 진입, ±{cfg['tp_pct']:g}% · "
+                  f"{cfg.get('max_hold_min') or '-'}분 · {clk(session_times(d, cfg)[2])} 청산)" if core.entry_type == "C" else
+                  f"C 알림 {sum(r['type'] == 'C' for r in ev)}건 · B 신호 {sum(r['type'] == 'B' for r in ev)}건")]
         for r in ev:
             if r["type"] == "C":
                 lines.append(f"🟡 C {r['tk']} {clk(r['t'])} | 고점 {money(r['peak'])} → 눌림 {money(r['pb_low'])} "
@@ -1327,27 +1350,34 @@ def backtest(cfg, ndays=None, use_cache=True):
             if nt.get("ema"):
                 skip["224 EMA 부족 (하루 전체)" if not nt.get("ema_ok") else "224 EMA 부족 (장 초반 일부 봉)"] += 1
             events += [dict(r, day=str(d)) for r in core.st["rows"]]
-    C = [e for e in events if e["type"] == "C"]
-    B = [e for e in events if e["type"] == "B"]
+    ent = cfg.get("entry_signal", "B")
+    B = [e for e in events if e["type"] == ent]                   # 진입 신호 (C 봉 또는 B 봉)
+    sig_name = "C 매수 신호" if ent == "C" else "B 신호"
+    tp_name = f"기본 ±{cfg['tp_pct']:g}%"
+    strats = [("pct", tp_name)] + ([("h1", "비교 익절=H1")] if ent == "B" else [])
     P(f"  5분봉 확인 {n_td - skip['5분봉 없음']}건 | " + (", ".join(f"{k} {v}" for k, v in skip.items()) or ""))
     stage = collections.defaultdict(set)
     for e in events:
         stage[e["type"]].add(e["pid"])
-    P(f"[패턴 단계] 눌림 후보 {len(stage['CAND'])} → C 알림 {len(stage['C'])} → H1 {len(stage['H1'])} → "
-      f"H2 확정(S 기록) {len(stage['H2'])} → S 재접근 {len(stage['RE'])} → B 신호 {len(stage['B'])}")
+    if ent == "C":
+        P(f"[패턴 단계] 눌림 후보 {len(stage['CAND'])} → C 매수 신호 {len(stage['C'])} (C 봉에서 바로 진입, B 추적 안 함)")
+    else:
+        P(f"[패턴 단계] 눌림 후보 {len(stage['CAND'])} → C 알림 {len(stage['C'])} → H1 {len(stage['H1'])} → "
+          f"H2 확정(S 기록) {len(stage['H2'])} → S 재접근 {len(stage['RE'])} → B 신호 {len(stage['B'])}")
     norm = lambda s: re.sub(r"\$?[\d][\d,.]*%?", "#", s)                    # 숫자 빼고 사유별로 묶기
-    for title, pids in (("눌림 후보 중 C 전에 끝남", stage["CAND"] - stage["C"]), ("C 알림 이후 B 전에 끝남", stage["C"] - stage["B"])):
+    for title, pids in (("눌림 후보 중 C 전에 끝남", stage["CAND"] - stage["C"]),) + \
+            ((("C 알림 이후 B 전에 끝남", stage["C"] - stage["B"]),) if ent == "B" else ()):
         why = collections.Counter(norm(e["why"]) for e in events if e["type"] in ("CANCEL", "EXPIRE") and e["pid"] in pids)
         P(f"   [{title}] " + " / ".join(f"{k}: {v}" for k, v in why.most_common(6)))
     nocand = collections.Counter(norm(e["why"]) for e in events if e["type"] == "NOCAND")
     if nocand:
         P("   [후보 아님] " + " / ".join(f"{k}: {v}" for k, v in nocand.most_common(4)))
     if not B:
-        P("B 신호가 없어 매매 비교를 할 수 없습니다.")
+        P(f"{sig_name}가 없어 매매가 없습니다 (승률 계산 불가).")
         _save_bt(out_lines, events, [], [])
         return
     # 4) 1분봉 (체결·청산 순서 확인용)
-    print(f"[4/5] B 신호 {len(B)}건 1분봉")
+    print(f"[4/5] {sig_name} {len(B)}건 1분봉")
     need = collections.defaultdict(set)
     for e in B:
         need[e["tk"]].add(pd.Timestamp(e["day"]).date())
@@ -1365,24 +1395,30 @@ def backtest(cfg, ndays=None, use_cache=True):
     # 5) 공통 표본 비교
     print("[5/5] 매매 시뮬레이션")
     P("")
-    P("━━ ① 공통 표본: 같은 B 신호·같은 진입을 계좌 한도 없이 각각 청산 ━━")
+    P(f"━━ ① 공통 표본: 같은 {sig_name}·같은 진입을 계좌 한도 없이 각각 청산 ━━")
     common = []
     for e in signal_order(B):
         d = pd.Timestamp(e["day"]).date()
         _, _, flat = session_times(d, cfg)
         df1 = _day_minutes(m1[e["tk"]], d, cfg, ts(e["t_end"]), flat) if e["tk"] in m1 else pd.DataFrame()
-        res = {(s, m): run_trade(cfg, e, df1, s, m) for s in ("pct", "h1") for m in ("cons", "opt")}
+        res = {(s, m): run_trade(cfg, e, df1, s, m) for s, _ in strats for m in ("cons", "opt")}
         common.append((e, res))
     base_ok = [x for x in common if x[1][("pct", "cons")]["status"] == "ok"]
-    both = [x for x in base_ok if x[1][("h1", "cons")]["status"] == "ok"]
-    na = sum(1 for x in base_ok if x[1][("h1", "cons")]["status"] == "na")
-    P(f"B 신호 {len(B)}건 중 체결 {len(base_ok)}건 (1분봉 없음 등 미체결 {len(B) - len(base_ok)}건) | "
-      f"H1 <= 진입가라 비교 불가 {na}건 | 두 전략 공통 표본 {len(both)}건")
+    if ent == "B":
+        both = [x for x in base_ok if x[1][("h1", "cons")]["status"] == "ok"]
+        na = sum(1 for x in base_ok if x[1][("h1", "cons")]["status"] == "na")
+        P(f"{sig_name} {len(B)}건 중 체결 {len(base_ok)}건 (1분봉 없음 등 미체결 {len(B) - len(base_ok)}건) | "
+          f"H1 <= 진입가라 비교 불가 {na}건 | 두 전략 공통 표본 {len(both)}건")
+        samples = (("체결된 전체", base_ok), ("공통 표본", both))
+    else:
+        P(f"{sig_name} {len(B)}건 중 체결 {len(base_ok)}건 (1분봉 없음 등 미체결 {len(B) - len(base_ok)}건) | "
+          f"비교 전략(익절=H1)은 C 진입 시점에 H1 이 아직 없어 해당 없음")
+        samples = (("체결된 전체", base_ok),)
     hdr = f"{'':16}{'거래':>5}{'승률':>8}{'평균순손익':>11}{'익절':>5}{'손절':>5}{'시간청산':>8}{'불명':>5}"
-    for label, sample in (("체결된 전체", base_ok), ("공통 표본", both)):
+    for label, sample in samples:
         P(f"[{label}]")
         P(hdr)
-        for s, name in (("pct", "기본 ±7%"), ("h1", "비교 익절=H1")):
+        for s, name in strats:
             if s == "h1" and label == "체결된 전체":
                 continue
             for m, mn in (("cons", "보수"), ("opt", "낙관")):
@@ -1398,7 +1434,8 @@ def backtest(cfg, ndays=None, use_cache=True):
     acct_trades = []
     P(f"{'':16}{'거래':>5}{'승률':>8}{'거래당':>9}{'일평균':>9}{'누적':>9}{'최대낙폭':>9}{'한도놓침':>8}{'잠금놓침':>8}"
       f"{'+3%일':>6}{'-3%일':>6}{'미도달':>6}{'불명':>6}")
-    for s, name in (("pct", "기본 ±7%"), ("h1", "비교 익절=H1")):
+    daily_rows = []
+    for s, name in strats:
         for m, mn in (("cons", "보수"), ("opt", "낙관")):
             eq, curve, rets, trades = cfg["capital"], [cfg["capital"]], [], []
             miss_s = miss_l = up = dn = amb = 0
@@ -1417,22 +1454,31 @@ def backtest(cfg, ndays=None, use_cache=True):
                     dn += st_["locked"]["why"].startswith("계좌 -")
                 for t in st_["trades"]:
                     acct_trades.append(dict(t, strategy=name, mode=mn))
+                if st_["trades"] and s == "pct" and m == "cons":
+                    w_ = sum(t["net_pct"] > 0 for t in st_["trades"])
+                    daily_rows.append(f"   {d} 거래 {len(st_['trades'])} (이익 {w_}) 계좌 {rets[-1]:+.2f}%"
+                                      + (f" [{st_['locked']['why']}]" if st_["locked"] else ""))
             c_ = np.array(curve)
             mdd = ((c_ / np.maximum.accumulate(c_)) - 1).min() * 100
             ss = _stats(trades)
             P(f"{name + ' ' + mn:16}{ss['n']:>5}{ss['win']:>7.1f}%{ss['avg']:>+8.2f}%{np.mean(rets):>+8.2f}%"
               f"{(eq / cfg['capital'] - 1) * 100:>+8.1f}%{mdd:>8.1f}%{miss_s:>8}{miss_l:>8}{up:>6}{dn:>6}{len(days) - up - dn:>6}{amb:>6}")
+    if daily_rows:
+        P(f"[거래가 있었던 날 ({tp_name} 보수)]")
+        for x in daily_rows:
+            P(x)
     P("")
     P("※ 보수 = 한 1분봉 안에서 익절·손절 둘 다 닿으면 손절 먼저, 계좌 -3% 는 보유 종목 저가 기준 / "
       "낙관 = 익절 먼저, 계좌 +3% 는 고가 기준. 불명 = 1분봉으로도 순서를 알 수 없는 건수")
     P(f"※ 비용: 매수·매도 각 {cfg['fee_pct']:g}% 수수료 + 시장가성 체결 {cfg['slippage_pct']:g}% 슬리피지 (익절 지정가는 슬리피지 없음)")
-    P(f"※ 진입: B 신호봉 마감 {cfg['entry_delay_min']}분 뒤 1분봉 시가. 청산: 익절 +{cfg['tp_pct']:g}% · 손절 -{cfg['sl_pct']:g}%"
+    P(f"※ 진입: {ent} 신호봉 마감 {cfg['entry_delay_min']}분 뒤 1분봉 시가. 청산: 익절 +{cfg['tp_pct']:g}% · 손절 -{cfg['sl_pct']:g}%"
       + (f" · 진입 {cfg['max_hold_min']:g}분 뒤" if cfg.get("max_hold_min") else "")
       + f" · {clk(session_times(days[-1], cfg)[2])} 전량 (그 이후 봉은 패턴도 안 봄)")
     P(f"(소요 {time.time() - t0:.0f}초)")
     rows = []
     for e, res in common:
-        r = dict(day=e["day"], tk=e["tk"], t=e["t"], h1=e["h1"], h2=e["h2"], S=e["S"], close=e["close"])
+        r = dict(day=e["day"], tk=e["tk"], t=e["t"], type=e["type"], peak=e.get("peak"), pb_low=e.get("pb_low"),
+                 h1=e.get("h1"), h2=e.get("h2"), S=e.get("S"), close=e["close"])
         for (s, m), x in res.items():
             r[f"{s}_{m}"] = x.get("net_pct") if x["status"] == "ok" else x["status"]
             r[f"{s}_{m}_why"] = x.get("why")
@@ -1479,8 +1525,9 @@ def premarket_alert(cfg, top=15):
         lines.append(f"• {s} {pc:+.1f}% {money(px)} | 최근 체결 {t.tz_convert(ET_S):%H:%M}ET\n   {name}")
     if not rows:
         lines.append("조건에 맞는 종목 없음")
-    lines.append(f"정규장 {clk(at(d, cfg['regular_start_et']))}부터 5분봉으로 급등 → 20~40% 눌림 → C 알림, "
-                 f"B자리 나오면 매수 신호 보냄 (청산 ±{cfg['tp_pct']:g}% · {cfg.get('max_hold_min') or '-'}분 · {clk(flat)})")
+    how = "C자리(눌림 후 첫 반등 봉)에서 매수 신호" if cfg.get("entry_signal", "B") == "C" else "C 알림, B자리에서 매수 신호"
+    lines.append(f"정규장 {clk(at(d, cfg['regular_start_et']))}부터 5분봉으로 급등 → 20~40% 눌림 → {how} "
+                 f"(청산 ±{cfg['tp_pct']:g}% · 진입 {cfg.get('max_hold_min') or '-'}분 뒤 · {clk(flat)} 전량)")
     return "\n".join(lines)
 
 
