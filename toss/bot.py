@@ -20,6 +20,7 @@ bot.py - 토스 자동매수 봇 (FL 신호 → 자동 승인 → 다음 강의 
        python3 bot.py --check  점검만: 환경변수·토스 예수금·텔레그램 봇 확인 (메시지 안 보냄)
 표준 라이브러리만 사용
 """
+import gzip
 import html
 import json
 import os
@@ -117,13 +118,29 @@ def answer(cq_id, text=""):
 
 
 # ═════════════════════ 토스 API (toss_api_docs.md) ═════════════════════
+def _raw(resp):
+    """응답 본문. 토스는 오류 응답을 gzip 으로 압축해서 보냄 -> 풀어서 반환"""
+    data = resp.read()
+    if (resp.headers.get("Content-Encoding") or "").lower() == "gzip" or data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except OSError:
+            pass
+    return data
+
+
+def _json(resp):
+    data = _raw(resp)
+    return json.loads(data) if data else {}
+
+
 def toss_get_token():
     data = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": TOSS_CLIENT_ID,
                                    "client_secret": TOSS_CLIENT_SECRET}).encode()
     req = urllib.request.Request(f"{TOSS_BASE}/oauth2/token", data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())["access_token"]
+        return _json(r)["access_token"]
 
 
 def toss_get(path, token, account_seq=None):
@@ -132,7 +149,7 @@ def toss_get(path, token, account_seq=None):
     if account_seq is not None:
         req.add_header("X-Tossinvest-Account", str(account_seq))
     with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+        return _json(r)
 
 
 def toss_delete(path, token, account_seq):
@@ -140,8 +157,7 @@ def toss_delete(path, token, account_seq):
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("X-Tossinvest-Account", str(account_seq))
     with urllib.request.urlopen(req, timeout=10) as r:
-        body = r.read()
-        return json.loads(body) if body else {}
+        return _json(r)
 
 
 def get_account_seq(token):
@@ -170,7 +186,7 @@ def toss_cancel_order(pos):
         toss_delete(f"/api/v1/orders/{pos['order_id']}", token, pos["account_seq"])
         return "cancelled", token
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
+        body = _raw(e).decode("utf-8", "replace")
         return ("gone" if "not-found" in body else f"error: HTTP {e.code} {body[:120]}"), token
 
 

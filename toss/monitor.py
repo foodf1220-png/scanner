@@ -28,6 +28,7 @@ monitor.py - 승인된 종목 주문·체결 확인 (크론으로 1분마다). 5
   · 이전 실행이 아직 돌고 있으면 이번 실행은 건너뜀
 키: 서버 /home/ubuntu/bot.env (TOSS_CLIENT_ID, TOSS_CLIENT_SECRET, TELEGRAM_TOKEN) - 크론은 run_with_env.sh 로 실행
 """
+import gzip
 import html
 import json
 import math
@@ -149,8 +150,24 @@ def send_message(chat_id, text):
 
 # ── Toss API (toss_api_docs.md) ──────────────────────────────────────────────
 
+def _raw(resp):
+    """응답 본문. 토스는 오류 응답을 gzip 으로 압축해서 보냄 (2026-11-25 확인) -> 풀어서 반환"""
+    data = resp.read()
+    if (resp.headers.get("Content-Encoding") or "").lower() == "gzip" or data[:2] == b"\x1f\x8b":
+        try:
+            data = gzip.decompress(data)
+        except OSError:
+            pass
+    return data
+
+
+def _json(resp):
+    data = _raw(resp)
+    return json.loads(data) if data else {}
+
+
 def _read_error(e):
-    body = e.read().decode("utf-8", errors="replace")
+    body = _raw(e).decode("utf-8", errors="replace")
     try:
         err = json.loads(body).get("error", {})
         return err.get("code", ""), err.get("message", body[:200])
@@ -164,7 +181,7 @@ def toss_get_token():
     req = urllib.request.Request(f"{TOSS_BASE}/oauth2/token", data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())["access_token"]
+        return _json(r)["access_token"]
 
 
 def toss_get(path, token, account_seq=None):
@@ -173,7 +190,7 @@ def toss_get(path, token, account_seq=None):
     if account_seq is not None:
         req.add_header("X-Tossinvest-Account", str(account_seq))
     with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+        return _json(r)
 
 
 def toss_post(path, token, account_seq, payload):
@@ -182,7 +199,7 @@ def toss_post(path, token, account_seq, payload):
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Tossinvest-Account", str(account_seq))
     with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
+        return _json(r)
 
 
 def get_account_seq(token):
@@ -216,8 +233,7 @@ def toss_delete(path, token, account_seq):
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("X-Tossinvest-Account", str(account_seq))
     with urllib.request.urlopen(req, timeout=10) as r:
-        body = r.read()
-        return json.loads(body) if body else {}
+        return _json(r)
 
 
 def place_market_buy(token, account_seq, symbol, quantity):
