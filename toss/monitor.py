@@ -64,7 +64,10 @@ TP_PCT             = float(os.environ.get("TP_PCT", "5"))                # pct �
 BE_TRIGGER_PCT     = float(os.environ.get("BE_TRIGGER_PCT", "3"))        # 매수가 +3% 이상이면 손절을 매수가(+수수료)로
 MAX_HOLD_MIN       = float(os.environ.get("MAX_HOLD_MIN", "0"))          # 체결 후 이 분이 지나면 시장가 청산 (0 = 끔)
 FORCE_EXIT_KST     = os.environ.get("FORCE_EXIT_KST", "").strip()        # 예 "02:30": 한국 시각으로 전량 청산 (마감 10분 전보다 이르면)
+ACCOUNT_TARGET_PCT = float(os.environ.get("ACCOUNT_TARGET_PCT", "0"))    # 계좌 당일 +5% -> 전량 청산·신규 중단 (0 = 끔)
+ACCOUNT_STOP_PCT   = float(os.environ.get("ACCOUNT_STOP_PCT", "0"))      # 계좌 당일 -3% -> 전량 청산·신규 중단 (0 = 끔)
 KST = ZoneInfo("Asia/Seoul")
+DAY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "account_day.json")   # 당일 시작 금액·실현 손익·잠금 (bot.py 도 읽음)
 FLATTEN_BEFORE_MIN = 10            # 장 마감 10분 전 청산
 COND_EXPIRE_DAYS   = 90            # 조건주문 유효기간 (문서: 등록일 + 90일 정도)
 
@@ -310,6 +313,115 @@ def cancel_conditional(token, account_seq, cid):
         return "gone" if "not-found" in (code + msg) else f"error: {e.code} {code} {msg[:80]}"
     except Exception as e:
         return f"error: {type(e).__name__}"
+
+
+# ── 계좌 전체 손익 (당일) ────────────────────────────────────────────────────
+# 토스 문서에 계좌 전체 잔고 API 가 없어서: 시작 금액 = 그날 처음 계산할 때의 달러 예수금(+보유 평가액),
+# 계좌 손익 = 오늘 실현 손익(청산 추정가 기준) + 보유 종목 평가손익 (수수료 제외)
+
+def load_day():
+    try:
+        with open(DAY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_day(d):
+    tmp = DAY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(tmp, DAY_FILE)
+
+
+def ensure_day(token, positions):
+    d = load_day()
+    today = f"{datetime.now(ET):%Y-%m-%d}"
+    if d.get("date") == today:
+        return d
+    acc = get_account_seq(token)
+    start = get_available_usd(token, acc)
+    for sym, p in positions.items():
+        if p.get("status") in ("OPEN", "BREAKEVEN", "CLOSING") and p.get("buy_price"):
+            try:
+                start += float(p["quantity"]) * get_current_price(token, sym)
+            except Exception:
+                start += float(p["quantity"]) * float(p["buy_price"])
+    d = dict(date=today, start_eq=round(start, 2), realized=0.0, locked=None)
+    save_day(d)
+    log(f"오늘 계좌 시작 금액 ${start:,.2f} (달러 예수금 + 보유 평가)")
+    return d
+
+
+def add_realized(symbol, pos, exit_px):
+    """청산 확인 때 실현 손익 추정 (청산 추정가 - 매수가) x 수량"""
+    if not exit_px or not pos.get("buy_price"):
+        return
+    d = load_day()
+    if d.get("date") != f"{datetime.now(ET):%Y-%m-%d}":
+        return
+    pnl = (float(exit_px) - float(pos["buy_price"])) * float(pos.get("quantity") or 0)
+    d["realized"] = round(float(d.get("realized") or 0) + pnl, 2)
+    save_day(d)
+
+
+def account_check(token, positions):
+    """장중 계좌 손익 확인 -> +목표 / -한도 처음 도달 시 잠금 (그날 유지). 반환: 잠금 정보 또는 None"""
+    if not (ACCOUNT_TARGET_PCT or ACCOUNT_STOP_PCT):
+        return None
+    d = ensure_day(token, positions)
+    if d.get("locked"):
+        return d["locked"]
+    if not is_market_open():
+        return None
+    unreal = 0.0
+    for sym, p in positions.items():
+        if p.get("status") in ("OPEN", "BREAKEVEN", "CLOSING") and p.get("buy_price"):
+            try:
+                unreal += (get_current_price(token, sym) - float(p["buy_price"])) * float(p["quantity"])
+            except Exception:
+                pass
+    ret = (float(d.get("realized") or 0) + unreal) / float(d["start_eq"]) * 100 if d.get("start_eq") else 0.0
+    log(f"계좌 당일 손익 {ret:+.2f}% (실현 ${float(d.get('realized') or 0):+.2f} · 평가 ${unreal:+.2f} · 시작 ${d['start_eq']:,.2f})")
+    why = None
+    if ACCOUNT_TARGET_PCT and ret >= ACCOUNT_TARGET_PCT:
+        why = f"계좌 +{ACCOUNT_TARGET_PCT:g}% 도달"
+    elif ACCOUNT_STOP_PCT and ret <= -ACCOUNT_STOP_PCT:
+        why = f"계좌 -{ACCOUNT_STOP_PCT:g}% 도달"
+    if not why:
+        return None
+    d["locked"] = dict(why=why, ret=round(ret, 2), t=datetime.now(timezone.utc).isoformat())
+    save_day(d)
+    log(f"⛔ {why} ({ret:+.2f}%) → 전량 청산, 오늘 신규 매수 중단")
+    chat = os.environ.get("TELEGRAM_CHAT_ID") or next((p.get("chat_id") for p in positions.values()), None)
+    if chat:
+        send_message(chat, f"⛔ <b>{why}</b> ({ret:+.2f}%)\n보유 종목 전량 시장가 청산 · 대기 주문 취소 · 오늘 신규 매수 중단")
+    return d["locked"]
+
+
+def liquidate_locked(token, symbol, pos, why):
+    """계좌 잠금: 승인 대기는 정리, 주문 중은 취소 시도, 보유는 시장가 청산"""
+    st = pos.get("status")
+    if st == "APPROVED":
+        clear_symbol(symbol)
+        send_message(pos["chat_id"], f"⏭ {b(symbol)} 매수 안 함 - {html.escape(why)}")
+    elif st == "PENDING" and pos.get("order_id"):
+        try:
+            toss_delete(f"/api/v1/orders/{pos['order_id']}", token, pos["account_seq"])
+            qty, _ = get_holding(token, pos["account_seq"], symbol)
+            if qty is not None and qty - float(pos.get("base_qty") or 0) < 1:
+                clear_symbol(symbol)
+                send_message(pos["chat_id"], f"⏭ {b(symbol)} 매수 주문 취소 - {html.escape(why)}")
+        except Exception as e:
+            log(f"{symbol} 잠금 중 주문 취소 결과: {type(e).__name__} (체결됐으면 다음 실행 때 청산)")
+            handle_pending(token, symbol, pos)
+    elif st in ("OPEN", "BREAKEVEN"):
+        qty_now, _ = get_holding(token, pos["account_seq"], symbol)
+        if qty_now is not None and qty_now - float(pos.get("base_qty") or 0) < 1:
+            return resolve_closed(token, symbol, pos)
+        start_close(token, symbol, pos, f"{why} → 전량 청산")
+    elif st == "CLOSING":
+        handle_closing(token, symbol, pos)
 
 
 # ── 상태별 처리 ──────────────────────────────────────────────────────────────
@@ -566,6 +678,7 @@ def resolve_closed(token, symbol, pos):
         except Exception:
             px = 0.0
     clear_symbol(symbol)
+    add_realized(symbol, pos, px)
     log(f"{symbol} {why} - 매수 ${E:.2f} → 약 ${px:.2f} (조건주문 취소 결과 {r})")
     send_message(pos["chat_id"], f"{mark} {b(symbol)} {html.escape(why)}\n\n매수 ${E:.2f} → 약 ${px:.2f} "
                                  f"({pnl_text(E, px)}, 수수료 전) × {float(pos.get('quantity') or 0):g}주\n남은 조건주문은 취소했어요.")
@@ -582,6 +695,7 @@ def handle_closing(token, symbol, pos):
         except Exception:
             px = float(pos.get("close_ref_price") or 0)
         clear_symbol(symbol)
+        add_realized(symbol, pos, px)
         log(f"{symbol} 청산 완료 ({pos.get('close_reason')})")
         send_message(pos["chat_id"], f"✅ {b(symbol)} 청산 완료 - {html.escape(str(pos.get('close_reason')))}\n\n"
                                      f"매수 ${E:.2f} → 약 ${px:.2f} ({pnl_text(E, px)}, 수수료 전) × {pos.get('sell_qty')}주")
@@ -630,10 +744,18 @@ def main():
     except Exception as e:
         log(f"토스 토큰 발급 실패: {type(e).__name__}: {e}")
         return
+    locked = None
+    if LIVE_ORDERS:
+        try:
+            locked = account_check(token, positions)                 # 계좌 기준이 개별 종목보다 먼저
+        except Exception as e:
+            log(f"계좌 손익 확인 오류: {type(e).__name__}: {e}")
     for symbol, pos in list(positions.items()):
         try:
             status = pos.get("status")
-            if status == "APPROVED":
+            if locked:
+                liquidate_locked(token, symbol, pos, locked["why"])
+            elif status == "APPROVED":
                 handle_approved(token, symbol, pos)
             elif status == "PENDING":
                 handle_pending(token, symbol, pos)

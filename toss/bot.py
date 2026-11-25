@@ -235,10 +235,23 @@ def retry_buttons(sid, label="🔁 다시 시도"):
     return [[{"text": label, "callback_data": f"retry:{sid}"}, {"text": "⏭ 패스", "callback_data": f"pass:{sid}"}]]
 
 
+def day_lock():
+    """monitor.py 가 기록한 오늘 계좌 잠금 (+5% / -3% 도달) 이 있으면 그 정보"""
+    try:
+        with open(os.path.join(HERE, "account_day.json"), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return d.get("locked") if d.get("date") == f"{datetime.now(ET):%Y-%m-%d}" else None
+
+
 def auto_approve(state, sid, message_id):
     s = state["signals"][sid]
     tk = s["tk"]
     head = signal_text(s)
+    lk = day_lock()
+    if lk:
+        return edit_message(TG_CHAT, message_id, f"{head}\n\n⏭ {html.escape(lk['why'])} ({lk['ret']:+.2f}%) - 오늘은 신규 매수 안 해요.")
     try:
         positions = load_positions()
     except Exception as e:
