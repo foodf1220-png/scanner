@@ -128,8 +128,9 @@ def m5_context(F, hist5, day):
     return c5, e5, e5p
 
 
-def detect(F, cfg, W, tk, float_sh, m5):
-    """반환 (돌파 후보 목록, 사건 카운트). 돌파 후보 = 기본 조건 통과 돌파 + 필터별 판정값(flags)"""
+def detect(F, cfg, W, tk, float_sh, m5, return_state=False):
+    """반환 (돌파 후보 목록, 사건 카운트[, (마지막 상태, 패턴)]). 돌파 후보 = 기본 조건 통과 돌파 + 필터별 판정값
+    return_state: 실시간용 - 마지막 완성봉 뒤의 상태 (READY 면 매수 기준가 trigger 등)"""
     o, h, l, c, v = (F[k].to_numpy(float) for k in ("Open", "High", "Low", "Close", "Volume"))
     e, w = F["ema"].to_numpy(), F["vwap"].to_numpy()
     chg, rv, gap = F["chg"].to_numpy(), F["rvol"].to_numpy(), F["gap"].to_numpy()
@@ -243,6 +244,8 @@ def detect(F, cfg, W, tk, float_sh, m5):
         st["P"] = dict(start=l[s], si=s, high=h[i], hi=i, no=poles, pb=[], pb_low=np.inf)
         st["state"] = "TRACKING"
         poles += 1
+    if return_state:
+        return out, ev, (st["state"], st["P"])
     if st["state"] != "SCANNER":
         ev["장 끝까지 돌파 없음"] += 1
     return out, ev

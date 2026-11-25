@@ -24,6 +24,7 @@ import gzip
 import html
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -46,6 +47,9 @@ TOSS_BASE = "https://openapi.tossinvest.com"
 HERE           = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE     = os.path.join(HERE, "bot_state.json")
 SIGNAL_QUEUE   = os.environ.get("FL_SIGNAL_QUEUE", "/home/ubuntu/scanner/state/fl_signal_queue.jsonl")
+ACCEPT         = {x.strip() for x in os.environ.get("ACCEPT_STRATEGY", "BF").split(",") if x.strip()}   # 실전으로 받을 전략
+STRATEGY_NAME  = {"BF": "Bull Flag", "FL": "FL"}
+MONITOR_LOG    = os.environ.get("MONITOR_LOG", "/home/ubuntu/monitor.log")
 
 MAX_POSITIONS      = int(os.environ.get("MAX_POSITIONS", "3"))
 POSITION_PCT       = float(os.environ.get("POSITION_PCT", "30"))
@@ -204,13 +208,27 @@ def account_plan(buying_power, positions):
 
 def signal_text(s):
     name = f" ({html.escape(s['name'][:30])})" if s.get("name") else ""
-    lines = [f"📈 <b>FL 매수 신호</b>", f"종목: <b>{html.escape(s['tk'])}</b>{name}",
+    strat = STRATEGY_NAME.get(s.get("strategy", "FL"), s.get("strategy", "FL"))
+    lines = [f"📈 <b>{strat} 매수 신호</b>", f"종목: <b>{html.escape(s['tk'])}</b>{name}",
              f"신호: {clock(s['t_detect'])} · 신호가 {money(s['px'])}"]
+    if s.get("trigger"):
+        lines.append(f"매수 기준가 {money(s['trigger'])} 돌파 · 깃대 +{s.get('pole_pct', 0):.1f}% · 되돌림 {s.get('retr', 0):.0f}% · "
+                     f"눌림 {s.get('pb_bars', 0)}봉")
     if s.get("SL") and s.get("TP"):
         lines.append(f"손절 {money(s['SL'])} (-{s['sl_pct']:.2f}%) · 익절 {money(s['TP'])} (+{s['tp_pct']:.2f}%) · "
                      f"눌림 저점 {money(s['L'])}")
-    lines.append(f"당일 {s.get('chg', 0):+.0f}% · RVOL {s.get('rvol') or 0:.1f} · 점수 {s.get('score') or 0:.0f}")
+    lines.append(f"당일 {s.get('chg', 0):+.0f}% · RVOL {s.get('rvol') or 0:.1f}" + (f" · 점수 {s['score']:.0f}" if s.get("score") else ""))
     return "\n".join(lines)
+
+
+def run_monitor_now():
+    """승인 즉시 monitor.py 한 번 실행 (1분 크론을 기다리지 않음). 동시에 돌면 monitor.py 가 알아서 건너뜀"""
+    try:
+        out = open(MONITOR_LOG, "a")
+        subprocess.Popen([sys.executable, os.path.join(HERE, "monitor.py")], stdout=out, stderr=subprocess.STDOUT,
+                         cwd=HERE, start_new_session=True)
+    except Exception as e:
+        log(f"monitor.py 즉시 실행 실패 (1분 크론이 처리): {type(e).__name__}: {e}")
 
 
 def retry_buttons(sid, label="🔁 다시 시도"):
@@ -259,10 +277,11 @@ def auto_approve(state, sid, message_id):
                                 f"${plan['total']:.2f}\n{why}", retry_buttons(sid))
         positions[tk] = dict(symbol=tk, status="APPROVED", chat_id=TG_CHAT, message_id=message_id, budget=amount,
                              signal_low=s.get("L"), stop=s.get("SL"), target=s.get("TP"), signal_price=s.get("px"),
-                             signal_id=sid, approved_at=now_utc().isoformat(), source="FL")
+                             signal_id=sid, approved_at=now_utc().isoformat(), source=s.get("strategy", "FL"))
         save_positions(positions)
         n = len(positions)
     log(f"{tk} 자동 승인 ${amount:.2f} (예수금 ${buying_power:.2f}, {n}/{MAX_POSITIONS})")
+    run_monitor_now()
     shares = f" → 약 {int(amount // price)}주 (토스 현재가 {money(price)})" if price else ""
     return edit_message(TG_CHAT, message_id,
                         f"{head}\n\n🤖 <b>자동 승인</b> ({n}/{MAX_POSITIONS}종목)\n"
@@ -273,6 +292,8 @@ def auto_approve(state, sid, message_id):
 
 
 def on_signal(state, s):
+    if s.get("strategy", "FL") not in ACCEPT:                 # 실전은 정한 전략만 (FL 모의 신호는 무시)
+        return
     age = (now_utc() - ts(s["t_detect"])).total_seconds()
     if age > SIGNAL_MAX_AGE_SEC:
         log(f"{s['tk']} 신호가 {age:.0f}초 지나서 건너뜀")
