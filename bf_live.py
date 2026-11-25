@@ -124,13 +124,19 @@ class BFLive:
         ready = {}
         for tk in live:
             v = self.cands[tk]
-            bars = regular_1m(data.get(tk), W)
-            done = bars[bars.index + MIN <= cut]
-            if len(done) < 3:
+            try:                                                   # 한 종목 오류가 전체를 멈추지 않게
+                bars = regular_1m(data.get(tk), W)
+                if bars.empty:                                     # 1분봉을 못 받은 종목 (빈 표는 시각 계산 불가)
+                    continue
+                done = bars[bars.index + MIN <= cut]
+                if len(done) < 3:
+                    continue
+                F = FC.build_frame(done, W, v["pc"], v["prof"], v["adv"], cfg)
+                m5 = BC.m5_context(F, v["h5"], W["open"].date())
+                _, _, (state, P) = BC.detect(F, cfg, W, tk, self.float_of(tk), m5, return_state=True)
+            except Exception as e:
+                self.log(f"{tk} 처리 오류 (건너뜀): {type(e).__name__}: {e}")
                 continue
-            F = FC.build_frame(done, W, v["pc"], v["prof"], v["adv"], cfg)
-            m5 = BC.m5_context(F, v["h5"], W["open"].date())
-            _, _, (state, P) = BC.detect(F, cfg, W, tk, self.float_of(tk), m5, return_state=True)
             if state != "READY":
                 continue
             key = f"{tk}|{iso(F.index[P['si']])}"
@@ -217,18 +223,21 @@ class BFLive:
             if now >= W["flat"]:
                 self.log(f"전량 청산 시각 {clk(W['flat'])} - 신호 종료 (청산은 monitor.py)")
                 break
-            try:
-                if now <= W["buy_end"] and (self.next_scan is None or now >= self.next_scan):
-                    self.scan(now, W)
-                    self.next_scan = now + pd.Timedelta(seconds=SCAN_SEC)
-                bar = (now - pd.Timedelta(seconds=5)).floor("min")
-                if bar != self.last_min and now <= W["buy_end"]:
-                    self.minute(now, W)
-                    self.last_min = bar
-                self.hot(now, W)
-            except Exception as e:
-                self.log(f"오류 (다음 주기에 다시): {type(e).__name__}: {e}")
-                traceback.print_exc()
+            bar = (now - pd.Timedelta(seconds=5)).floor("min")
+            steps = []                                             # 검색·1분 갱신·돌파 확인을 따로: 하나가 실패해도 나머지는 돎
+            if now <= W["buy_end"] and (self.next_scan is None or now >= self.next_scan):
+                self.next_scan = now + pd.Timedelta(seconds=SCAN_SEC)
+                steps.append(("검색", lambda: self.scan(now, W)))
+            if bar != self.last_min and now <= W["buy_end"]:
+                self.last_min = bar
+                steps.append(("1분 갱신", lambda: self.minute(now, W)))
+            steps.append(("돌파 확인", lambda: self.hot(now, W)))
+            for name, fn in steps:
+                try:
+                    fn()
+                except Exception as e:
+                    self.log(f"{name} 오류 (다음 주기에 다시): {type(e).__name__}: {e}")
+                    traceback.print_exc()
             time.sleep(max(1.0, HOT_SEC - (now_et() - now).total_seconds()))
 
     def check_once(self):

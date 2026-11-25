@@ -252,6 +252,12 @@ def auto_approve(state, sid, message_id):
     lk = day_lock()
     if lk:
         return edit_message(TG_CHAT, message_id, f"{head}\n\n⏭ {html.escape(lk['why'])} ({lk['ret']:+.2f}%) - 오늘은 신규 매수 안 해요.")
+    today = f"{datetime.now(ET):%Y-%m-%d}"
+    entered = state.setdefault("entered", {})
+    for d in [d for d in entered if d != today]:
+        entered.pop(d)
+    if tk in entered.get(today, []):
+        return edit_message(TG_CHAT, message_id, f"{head}\n\n⏭ 오늘 이미 매매한 종목이라 다시 사지 않아요 (당일 재진입 금지).")
     try:
         positions = load_positions()
     except Exception as e:
@@ -293,6 +299,7 @@ def auto_approve(state, sid, message_id):
                              signal_id=sid, approved_at=now_utc().isoformat(), source=s.get("strategy", "FL"))
         save_positions(positions)
         n = len(positions)
+    entered.setdefault(today, []).append(tk)                      # 당일 재진입 금지 (승인 취소해도 그날은 다시 안 삼)
     log(f"{tk} 자동 승인 ${amount:.2f} (예수금 ${buying_power:.2f}, {n}/{MAX_POSITIONS})")
     run_monitor_now()
     shares = f" → 약 {int(amount // price)}주 (토스 현재가 {money(price)})" if price else ""

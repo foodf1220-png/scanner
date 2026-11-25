@@ -48,7 +48,7 @@
   "max_positions": 2,
   "max_total_pct": 100.0,
   "min_cash_pct": 0.0,
-  "account_target_pct": 5.0,
+  "account_target_pct": 1000.0,
   "account_stop_pct": 3.0,
   "account_lock": true,
   "buy_start_et": "09:31",
