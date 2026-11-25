@@ -55,6 +55,7 @@ MAX_POSITIONS      = int(os.environ.get("MAX_POSITIONS", "3"))
 POSITION_PCT       = float(os.environ.get("POSITION_PCT", "30"))
 CASH_RESERVE_PCT   = float(os.environ.get("CASH_RESERVE_PCT", "10"))
 APPROVAL_TTL_MIN   = float(os.environ.get("APPROVAL_TTL_MIN", "5"))
+ALLOW_REENTRY      = os.environ.get("ALLOW_REENTRY", "true").strip().lower() in ("1", "true", "yes", "on")   # 같은 날 같은 종목 다시 매수 (보유 중이면 여전히 안 삼)
 SIGNAL_MAX_AGE_SEC = 120          # 이보다 오래된 신호는 자동 승인 안 함 (봇 재시작 때 밀린 신호 등)
 RETRY_MAX_AGE_SEC  = 300          # [🔁 다시 시도] 는 신호 후 5분까지만
 MIN_BUY_USD        = 1.0
@@ -256,7 +257,8 @@ def auto_approve(state, sid, message_id):
     entered = state.setdefault("entered", {})
     for d in [d for d in entered if d != today]:
         entered.pop(d)
-    if tk in entered.get(today, []):
+    prior = entered.get(today, []).count(tk)
+    if prior and not ALLOW_REENTRY:
         return edit_message(TG_CHAT, message_id, f"{head}\n\n⏭ 오늘 이미 매매한 종목이라 다시 사지 않아요 (당일 재진입 금지).")
     try:
         positions = load_positions()
@@ -299,12 +301,12 @@ def auto_approve(state, sid, message_id):
                              signal_id=sid, approved_at=now_utc().isoformat(), source=s.get("strategy", "FL"))
         save_positions(positions)
         n = len(positions)
-    entered.setdefault(today, []).append(tk)                      # 당일 재진입 금지 (승인 취소해도 그날은 다시 안 삼)
-    log(f"{tk} 자동 승인 ${amount:.2f} (예수금 ${buying_power:.2f}, {n}/{MAX_POSITIONS})")
+    entered.setdefault(today, []).append(tk)                      # 당일 매매 기록 (ALLOW_REENTRY=false 면 재진입 금지에 씀)
+    log(f"{tk} 자동 승인 ${amount:.2f} (예수금 ${buying_power:.2f}, {n}/{MAX_POSITIONS})" + (f" - 오늘 {prior + 1}번째 진입" if prior else ""))
     run_monitor_now()
     shares = f" → 약 {int(amount // price)}주 (토스 현재가 {money(price)})" if price else ""
     return edit_message(TG_CHAT, message_id,
-                        f"{head}\n\n🤖 <b>자동 승인</b> ({n}/{MAX_POSITIONS}종목)\n"
+                        f"{head}\n\n🤖 <b>자동 승인</b> ({n}/{MAX_POSITIONS}종목){f' · 오늘 {prior + 1}번째 진입' if prior else ''}\n"
                         f"달러 예수금: <b>${buying_power:.2f}</b> · 계좌 추정 ${plan['total']:.2f}\n"
                         f"매수 금액: <b>${amount:.2f}</b> (계좌의 {amount / plan['total'] * 100:.0f}%){shares}\n"
                         f"주문은 monitor.py 가 시장가로 넣어요 ({APPROVAL_TTL_MIN:g}분 안에 안 들어가면 승인 만료)",

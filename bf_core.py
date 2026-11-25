@@ -94,7 +94,7 @@ def derive(cfg, tp=None, sl=None, lock=None):
     c = copy.deepcopy(cfg)
     c.update(exit_style="fixed", fixed_tp_pct=cfg["tp_pct"] if tp is None else tp,
              fixed_sl_pct=cfg["sl_pct"] if sl is None else sl, risk_limit_pct=1e9, buy_start_kst=None,
-             buy_end_kst=None, no_reentry=True, ema_len=9, vol_avg_bars=20, min_order_usd=1.0, structure="pullback")
+             buy_end_kst=None, no_reentry=not cfg.get("allow_reentry", False), ema_len=9, vol_avg_bars=20, min_order_usd=1.0, structure="pullback")
     if lock is not None:
         c["account_lock"] = lock
     c["early_exits"] = {k: False for k in FC.DEFAULTS["early_exits"]}
