@@ -2,7 +2,7 @@
 """
 bf_live.py - Bull Flag V2 실시간 신호 (서버 bf-live.service, 평일 뉴욕 09:20 시작 ~ 장 마감 10분 전 종료)
 
-[조건] 백테스트에서 고른 'V2 + $1~2 + ±4%'
+[조건] V2 + 진입가 $2 이상 + 익절 +5% / 손절 -3% (사용자 지정, bf_config.json)
   검색기 (2분마다 전 종목): 장중 고가 >= 전일 종가 +10%, $0.5~20, 유통주식수 2,000만 주 미만, RVOL 3배(14거래일 같은 시각)
   1분 완성봉 상태 기계 (bf_core.detect): 깃대 5봉 +5% -> 눌림 1~4봉(되돌림 50%·VWAP 위·눌림 거래량 <= 깃대 60%) -> READY
   돌파 (5초마다): 현재가 > 매수 기준가 (직전 조정 음봉 고가), 기준가 +0.5% 이내, 현재가 > 9EMA > VWAP,
@@ -28,7 +28,6 @@ from fl_core import KST_S, MIN, clk, day_windows, iso, now_et, regular_1m, round
 
 QUEUE = os.path.join(FC.STATE_DIR, "fl_signal_queue.jsonl")
 FLOAT_FILE = os.path.join(FC.HERE, "cache", "bf_float.json")
-ENTRY_MIN, ENTRY_MAX = 1.0, 2.0                      # 백테스트에서 고른 진입가 범위
 SCAN_SEC, HOT_SEC = 120, 5
 
 
@@ -40,6 +39,7 @@ def _pb():
 class BFLive:
     def __init__(self, cfg, check=False):
         self.c, self.check = cfg, check
+        self.lo, self.hi = float(cfg["entry_min_price"]), float(cfg["entry_max_price"])   # 진입가 범위 (bf_config.json)
         self.cands, self.ready, self.fired, self.uni = {}, {}, set(), {}
         self.floats = json.load(open(FLOAT_FILE, encoding="utf-8")) if os.path.exists(FLOAT_FILE) else {}
         self.logf = None
@@ -138,7 +138,7 @@ class BFLive:
                 continue
             if not P["pb_vol"] <= cfg["pb_vol_ratio"] * P["pole_vol"]:     # V2 눌림 거래량
                 continue
-            if not (ENTRY_MIN * 0.99 <= P["trigger"] < ENTRY_MAX):
+            if not (self.lo * 0.99 <= P["trigger"] < self.hi):
                 continue
             ready[tk] = dict(P, key=key, ema=float(F["ema"].iat[-1]), vwap=float(F["vwap"].iat[-1]),
                              chg=float(F["chg"].iat[-1]), rvol=float(F["rvol"].iat[-1]) if F["rvol"].iat[-1] == F["rvol"].iat[-1] else None,
@@ -166,8 +166,8 @@ class BFLive:
             why = None
             if p > T * (1 + cfg["max_chase_pct"] / 100):
                 why = f"기준가 +{cfg['max_chase_pct']:g}% 초과 (${p:.4g} / 기준가 ${T:.4g}) - 추격 안 함"
-            elif not (ENTRY_MIN <= p < ENTRY_MAX):
-                why = f"진입가 ${p:.4g} 가 ${ENTRY_MIN:g}~{ENTRY_MAX:g} 밖"
+            elif not (self.lo <= p < self.hi):
+                why = f"진입가 ${p:.4g} 가 ${self.lo:g}~{self.hi:g} 밖"
             elif not (p > R["ema"] > R["vwap"]):
                 why = f"현재가 > 9EMA > VWAP 아님 (현재가 {p:.4g}, EMA {R['ema']:.4g}, VWAP {R['vwap']:.4g})"
             if why:
@@ -178,7 +178,8 @@ class BFLive:
     def emit(self, tk, R, p, now):
         rec = dict(strategy="BF", tk=tk, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
                    t=iso(now.floor("min")), t_sig=iso(now), t_detect=iso(now), px=round(p, 6), L=float(R["pb_low"]),
-                   SL=round_near(p * 0.96), TP=round_near(p * 1.04), sl_pct=4.0, tp_pct=4.0, chg=round(R["chg"], 2),
+                   SL=round_near(p * (1 - self.c["sl_pct"] / 100)), TP=round_near(p * (1 + self.c["tp_pct"] / 100)),
+                   sl_pct=self.c["sl_pct"], tp_pct=self.c["tp_pct"], chg=round(R["chg"], 2),
                    rvol=round(R["rvol"], 2) if R.get("rvol") else None, score=None, spread_pct=None, block=None,
                    trigger=float(R["trigger"]), pole_start=float(R["start"]), pole_high=float(R["high"]),
                    pole_pct=round((R["high"] / R["start"] - 1) * 100, 2), retr=round(float(R["retr"]), 1),
@@ -206,7 +207,7 @@ class BFLive:
             self.log("오늘 장이 끝났습니다 - 종료")
             return
         self.uni = load_universe()
-        self.log(f"Bull Flag V2 실시간 신호 시작 | 진입 ${ENTRY_MIN:g}~{ENTRY_MAX:g} | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
+        self.log(f"Bull Flag V2 실시간 신호 시작 | 진입 ${self.lo:g}~{self.hi:g} · 익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}% | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
                  f"유통주식 캐시 {len(self.floats)}종목")
         start = W["open"] + MIN + pd.Timedelta(seconds=5)
         while now_et() < start:

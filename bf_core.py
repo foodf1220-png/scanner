@@ -42,6 +42,7 @@ BF_DEFAULTS = {
     "filters": {"pb_volume": True, "breakout_volume": True, "hold_3s": True, "m5_trend": True, "m5_above": True,
                 "m1_slope": False, "tape": False, "spread": True, "room": False, "vwap_ext": False, "first_only": True},
     "tp_pct": 4.0, "sl_pct": 4.0,
+    "entry_min_price": 2.0, "entry_max_price": 20.0,   # 실시간 신호 진입가 범위 (bf_live.py)
     "position_pct": 30.0, "max_positions": 3, "max_total_pct": 90.0, "min_cash_pct": 10.0,
     "account_target_pct": 4.0, "account_stop_pct": 4.0, "account_lock": True,
     "buy_start_et": "09:31", "buy_end_et": "15:30", "flatten_before_close_min": 10,
