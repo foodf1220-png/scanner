@@ -361,7 +361,7 @@ class Simulation(unittest.TestCase):
         a = sim_day(solo_cfg(cfg0(exit_style="fixed")), W["open"].date(), W, {"TEST": F}, sigs, 100000.0)
         b = sim_day(solo_cfg(c), W["open"].date(), W, {"TEST": F}, sigs, 100000.0)
         self.assertEqual(a.st["trades"][0]["entry_t"], b.st["trades"][0]["entry_t"])
-        self.assertAlmostEqual(a.st["trades"][0]["SL"], round_tick(a.st["trades"][0]["avg"] * 0.93, True))
+        self.assertAlmostEqual(a.st["trades"][0]["SL"], round(a.st["trades"][0]["avg"] * 0.93, 2))   # 고정 %: 가까운 호가
 
     def test_trade_early_exit(self):
         W, df = make(tail="down")

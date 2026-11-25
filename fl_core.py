@@ -262,6 +262,11 @@ def round_tick(x, up):
     return round(k * t, 4)
 
 
+def round_near(x):
+    t = tick_size(x)
+    return round(round(x / t) * t, 4)
+
+
 def slip_pct(price, cfg):
     for up, pct in cfg["slippage_tiers"]:
         if up is None or price < up:
@@ -280,9 +285,9 @@ def levels(E, L, cfg):
     if E is None or not (E > 0) or L is None or not (L == L):
         return None
     D = E - L
-    if cfg.get("exit_style") == "fixed":
-        SL = round_tick(E * (1 - cfg["fixed_sl_pct"] / 100), True)
-        TP = round_tick(E * (1 + cfg["fixed_tp_pct"] / 100), False)
+    if cfg.get("exit_style") == "fixed":                # 고정 %: 가까운 호가로 (내림·올림하면 $1 대에서 ±4% 가 크게 틀어짐)
+        SL = round_near(E * (1 - cfg["fixed_sl_pct"] / 100))
+        TP = round_near(E * (1 + cfg["fixed_tp_pct"] / 100))
     else:
         if D <= 0:
             return None
