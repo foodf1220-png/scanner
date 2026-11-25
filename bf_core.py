@@ -257,8 +257,10 @@ def passes(rec, keys):
     return all(rec["flags"][k] for k in keys if FILTERS[k][1])
 
 
-def sim_signal(F, rec, cfg, W, tp, sl, amb="cons"):
-    """신호 하나만 (계좌 한도 없이). 진입 봉은 종가로만 손익절 판단, 다음 봉부터 고가·저가 (같은 봉 둘 다면 amb)"""
+def sim_signal(F, rec, cfg, W, tp, sl, amb="cons", max_hold=None):
+    """신호 하나만 (계좌 한도 없이). 진입 봉은 종가로만 손익절 판단, 다음 봉부터 고가·저가 (같은 봉 둘 다면 amb)
+    max_hold(분): 진입 후 그 시간이 지난 첫 봉 시가에 시장가 청산 (None 이면 cfg max_hold_min, 0 이면 끔)"""
+    max_hold = cfg.get("max_hold_min") if max_hold is None else max_hold
     o, h, l, c = (F[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
     j, raw = rec["j"], rec["entry_raw"]
     fee = cfg["fee_pct"] / 100
@@ -274,6 +276,9 @@ def sim_signal(F, rec, cfg, W, tp, sl, amb="cons"):
     while k_exit is None and k < len(F):
         if F.index[k] >= W["flat"]:
             k_exit, raw_exit, why, kind = k, o[k], "장 마감 청산", "market"
+            break
+        if max_hold and (F.index[k] - F.index[j]).total_seconds() / 60 >= max_hold:
+            k_exit, raw_exit, why, kind = k, o[k], "시간 청산", "market"
             break
         r = bar_exit(dict(SL=SL, TP=TP), o[k], h[k], l[k], False, amb)
         if r:

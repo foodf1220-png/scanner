@@ -151,6 +151,11 @@ def sim_account(cfg, days, items, recs, amb="cons"):
             for tk in list(Pp):
                 if tk in bars and Pp[tk]["exit_flag"]:
                     acct.sell(tk, A[tk][0][bars[tk]], t, Pp[tk]["exit_flag"], "market", cap(A[tk][4][bars[tk]]))
+            mh = cfg.get("max_hold_min")
+            for tk in list(Pp):
+                p = Pp.get(tk)
+                if p and tk in bars and mh and (t - ts(p["entry_min"])).total_seconds() / 60 >= mh:
+                    acct.sell(tk, A[tk][0][bars[tk]], t, "시간 청산", "market", cap(A[tk][4][bars[tk]]))
             for tk in list(Pp):
                 p = Pp.get(tk)
                 if p and tk in bars and ts(p["entry_min"]) < t:
@@ -202,7 +207,8 @@ def sim_account(cfg, days, items, recs, amb="cons"):
 # ═════════════════════ 통계 ═════════════════════
 def cat(why):
     w = str(why)
-    return "TP" if w.startswith("익절") else "SL" if w.startswith("손절") else "ACC" if w.startswith("계좌") else "EOD"
+    return ("TP" if w.startswith("익절") else "SL" if w.startswith("손절") else "ACC" if w.startswith("계좌")
+            else "TIME" if w.startswith("시간") else "EOD")
 
 
 def tstats(T):
