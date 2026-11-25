@@ -62,6 +62,9 @@ FEE_PCT            = float(os.environ.get("FEE_PCT", "0.2"))             # 손�
 SL_PCT             = float(os.environ.get("SL_PCT", "3"))                # pct 모드 손절 -3%
 TP_PCT             = float(os.environ.get("TP_PCT", "5"))                # pct 모드 익절 +5%
 BE_TRIGGER_PCT     = float(os.environ.get("BE_TRIGGER_PCT", "3"))        # 매수가 +3% 이상이면 손절을 매수가(+수수료)로
+MAX_HOLD_MIN       = float(os.environ.get("MAX_HOLD_MIN", "0"))          # 체결 후 이 분이 지나면 시장가 청산 (0 = 끔)
+FORCE_EXIT_KST     = os.environ.get("FORCE_EXIT_KST", "").strip()        # 예 "02:30": 한국 시각으로 전량 청산 (마감 10분 전보다 이르면)
+KST = ZoneInfo("Asia/Seoul")
 FLATTEN_BEFORE_MIN = 10            # 장 마감 10분 전 청산
 COND_EXPIRE_DAYS   = 90            # 조건주문 유효기간 (문서: 등록일 + 90일 정도)
 
@@ -95,10 +98,30 @@ def is_market_open(now=None):
     return now.replace(hour=9, minute=30, second=0, microsecond=0) <= now < close_time(now)
 
 
+def flatten_time(now):
+    """전량 청산 시각: 장 마감 10분 전, FORCE_EXIT_KST(예 한국 02:30)가 더 이르면 그 시각 (서머타임 자동)"""
+    ft = close_time(now) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+    if FORCE_EXIT_KST:
+        h, m = map(int, FORCE_EXIT_KST.split(":"))
+        for k in (0, 1):
+            x = (datetime(now.year, now.month, now.day, h, m, tzinfo=KST) + timedelta(days=k)).astimezone(ET)
+            if x.date() == now.date() and now.replace(hour=9, minute=30, second=0, microsecond=0) < x:
+                ft = min(ft, x)
+                break
+    return ft
+
+
+def flatten_reason(now):
+    ft = flatten_time(now)
+    if ft < close_time(now) - timedelta(minutes=FLATTEN_BEFORE_MIN):
+        return f"한국 {FORCE_EXIT_KST} 전량 청산"
+    return f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산"
+
+
 def is_flatten_time(now=None):
-    """장중이면서 마감 10분 전 이후 (뉴욕 15:50~16:00, 조기 폐장일 12:50~13:00)"""
+    """장중이면서 전량 청산 시각 이후"""
     now = now or datetime.now(ET)
-    return is_market_open(now) and now >= close_time(now) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+    return is_market_open(now) and now >= flatten_time(now)
 
 
 def tick(p):
@@ -304,6 +327,10 @@ def handle_approved(token, symbol, pos):
         log(f"{symbol} 매수 대기 중 (미국 정규장 시간 아님)")
         return
     chat = pos["chat_id"]
+    if is_flatten_time():                                         # 전량 청산 시각 이후엔 새로 사지 않음
+        send_message(chat, f"⏭ {b(symbol)} 매수 안 함 - {flatten_reason(datetime.now(ET))} 시각이 지났어요. 승인은 정리했어요.")
+        clear_symbol(symbol)
+        return
     account_seq = get_account_seq(token)
     requested = float(pos.get("budget") or 0)
     available = get_available_usd(token, account_seq)
@@ -416,7 +443,11 @@ def manage_open(token, symbol, pos):
             log(f"{symbol} 정규장 외 대기 (조건주문 없음)")
         return
     if is_flatten_time():
-        return start_close(token, symbol, pos, f"장 마감 {FLATTEN_BEFORE_MIN}분 전 청산")
+        return start_close(token, symbol, pos, flatten_reason(datetime.now(ET)))
+    if MAX_HOLD_MIN and pos.get("filled_at"):                     # 진입 후 60분 지나면 시장가 청산
+        held = (datetime.now(timezone.utc) - datetime.fromisoformat(pos["filled_at"])).total_seconds() / 60
+        if held >= MAX_HOLD_MIN:
+            return start_close(token, symbol, pos, f"진입 {MAX_HOLD_MIN:g}분 경과 청산")
 
     SL, TP = pos.get("SL"), pos.get("TP")
     if SL is None or TP is None:
@@ -462,13 +493,14 @@ def manage_open(token, symbol, pos):
         log(f"{symbol} {pos['status']} - 손절 ${fmt_px(SL)} / 익절 ${fmt_px(TP)} 조건주문 유지 (현재가 ${price:.2f}, {pnl_text(E, price)})")
     if not pos.get("exits_announced") and new:
         update_position(symbol, exits_announced=True)
-        flat = close_time(datetime.now(ET)) - timedelta(minutes=FLATTEN_BEFORE_MIN)
+        flat = flatten_time(datetime.now(ET))
         basis = (f"눌림 저점 ${fmt_px(float(pos['signal_low']))} 기준 3:1" if EXIT_MODE != "pct" else f"-{SL_PCT:g}% / +{TP_PCT:g}%")
         send_message(pos["chat_id"],
-                     f"🛡 {b(symbol)} 손절·익절 등록 ({basis}, 수수료 {FEE_PCT:g}% 보정)\n\n매수가 ${E:.2f}\n"
+                     f"🛡 {b(symbol)} 손절·익절 등록 ({basis}" + (f", 수수료 {FEE_PCT:g}% 보정" if FEE_PCT else "") + f")\n\n매수가 ${E:.2f}\n"
                      f"손절 ${fmt_px(SL)} ({pnl_text(E, SL)}) · 익절 ${fmt_px(TP)} ({pnl_text(E, TP)})\n"
-                     f"+{BE_TRIGGER_PCT:g}% 오르면 손절을 매수가+수수료로 올림 (브레이크이븐)\n"
-                     f"안 닿으면 뉴욕 {flat:%H:%M} (한국 {flat.astimezone(ZoneInfo('Asia/Seoul')):%H:%M}) 에 시장가 청산")
+                     + (f"+{BE_TRIGGER_PCT:g}% 오르면 손절을 매수가+수수료로 올림 (브레이크이븐)\n" if BE_TRIGGER_PCT < 100 else "")
+                     + (f"진입 {MAX_HOLD_MIN:g}분이 지나면 시장가 청산\n" if MAX_HOLD_MIN else "")
+                     + f"늦어도 뉴욕 {flat:%H:%M} (한국 {flat.astimezone(KST):%H:%M}) 에 시장가 청산")
     if failed and not pos.get("exits_fail_alerted"):
         update_position(symbol, exits_fail_alerted=True)
         send_message(pos["chat_id"], f"⚠️ {b(symbol)} {', '.join(failed)} 조건주문 등록 실패 - 1분마다 다시 시도해요")

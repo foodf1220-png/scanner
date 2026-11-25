@@ -215,7 +215,7 @@ class BFLive:
         while True:
             now = now_et()
             if now >= W["flat"]:
-                self.log("장 마감 10분 전 - 신호 종료 (청산은 monitor.py)")
+                self.log(f"전량 청산 시각 {clk(W['flat'])} - 신호 종료 (청산은 monitor.py)")
                 break
             try:
                 if now <= W["buy_end"] and (self.next_scan is None or now >= self.next_scan):
