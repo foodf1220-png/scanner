@@ -85,6 +85,19 @@ class Flow(Base):
         self.assertIn("① 기준선  - 이미 보유 중이라 안 삼", msg)
         self.assertEqual(sorted(p["v"] for p in self.R.open), ["①", "②", "③"])
 
+    def test_signal_shows_cumulative_return(self):
+        self.sig("KYNB", 2.00, "10:00")
+        self.assertIn("📊 전체 누적: 아직 끝난 거래 없음", self.sent[-1])
+        self.px["KYNB"] = 2.07
+        self.tick("10:05")                                             # ② 익절
+        r2 = self.trades()[0]["ret"]
+        self.sig("ATOS", 2.50, "10:30")
+        msg = self.sent[-1]
+        self.assertTrue(msg.splitlines()[-1].startswith("③ 재진입"))    # 누적이 메시지 맨 끝
+        self.assertIn("📊 전체 누적 (11/30부터", msg)
+        self.assertIn(f"② 승률형  수익률 {r2:+.2f}% · 승률 100% (1승 0패)", msg)
+        self.assertIn("① 기준선  거래 없음", msg)
+
     def test_stop_and_time_exit(self):
         self.sig("AAA", 3.00, "10:00")
         self.px["AAA"] = 2.87                                          # -4% 아래

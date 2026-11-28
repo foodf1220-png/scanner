@@ -134,6 +134,8 @@ class Research:
                                   src=rec.get("px_src") or ""))
             lines.append(f"{tag}  매수 {money(E)} → 익절 {money(TP)} / 손절 {money(SL)}")
         lines.append("(가상 매매 · 실제 주문 없음)")
+        lines.append("")
+        lines += self.cum_lines()
         self.save()
         self.send("\n".join(lines))
 
@@ -205,8 +207,26 @@ class Research:
         if not rows:
             return "0건"
         w = sum(r["ret"] > 0 for r in rows)
-        avg = sum(r["ret"] for r in rows) / len(rows)
-        return f"{len(rows)}건 {w}승 {len(rows) - w}패 (승률 {w / len(rows) * 100:.0f}%) 평균 {avg:+.2f}%"
+        tot = sum(r["ret"] for r in rows)
+        return (f"{len(rows)}건 {w}승 {len(rows) - w}패 (승률 {w / len(rows) * 100:.0f}%) "
+                f"평균 {tot / len(rows):+.2f}% · 합계 {tot:+.2f}%")
+
+    def cum_lines(self):
+        """전체 누적 수익률 (끝난 거래의 거래별 수익률 합, 버전별) - 신호 알림 맨 끝"""
+        hist = self.history()
+        if not hist:
+            return ["📊 전체 누적: 아직 끝난 거래 없음 (첫 청산부터 표시)"]
+        first = min(r["day"] for r in hist)
+        lines = [f"📊 전체 누적 ({first[5:].replace('-', '/')}부터 · 끝난 거래 기준)"]
+        for v in self.variants:
+            a = [r for r in hist if r["v"] == v["id"]]
+            if not a:
+                lines.append(f"{v['id']} {v['name']}  거래 없음")
+                continue
+            w = sum(r["ret"] > 0 for r in a)
+            lines.append(f"{v['id']} {v['name']}  수익률 {sum(r['ret'] for r in a):+.2f}% · 승률 {w / len(a) * 100:.0f}% "
+                         f"({w}승 {len(a) - w}패)")
+        return lines
 
     def day_end(self, now, W, quote):
         self.tick(now, W, quote, force=True)
