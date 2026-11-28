@@ -2,11 +2,12 @@
 """
 bf_live.py - Bull Flag V2 실시간 신호 (서버 bf-live.service, 평일 뉴욕 09:20 시작 ~ 장 마감 10분 전 종료)
 
-[조건] V2 + 진입가 entry_min_price~entry_max_price + 익절 tp_pct / 손절 sl_pct (bf_config.json, 실제 주문 % 는 서버 bot.env)
+[조건] V2 + 진입가 entry_price_ranges + 익절 tp_pct / 손절 sl_pct (bf_config.json, 실제 주문 % 는 서버 bot.env)
   검색기 (2분마다 전 종목): 장중 고가 >= 전일 종가 +10%, $0.5~20, 유통주식수 2,000만 주 미만, RVOL 3배(14거래일 같은 시각)
   1분 완성봉 상태 기계 (bf_core.detect): 깃대 5봉 +5% -> 눌림 1~4봉(되돌림 50%·VWAP 위·눌림 거래량 <= 깃대 60%) -> READY
-  돌파 (5초마다): 현재가 > 매수 기준가 (직전 조정 음봉 고가), 기준가 +0.5% 이내, 현재가 > 9EMA > VWAP,
-                신규 매수 시간 안, 깃대마다 첫 돌파 1번
+  돌파 (매수 대기 종목 있으면 2초마다 토스 실시간 현재가, 토스 안 되면 5초마다 야후 1분봉 종가):
+                현재가 > 매수 기준가 (직전 조정 음봉 고가), 기준가 +0.5% 이내, 현재가 > 9EMA > VWAP,
+                진입가 entry_price_ranges (예 $1~3, $10~20), 신규 매수 시간 안, 깃대마다 첫 돌파 1번
   -> state/fl_signal_queue.jsonl 에 strategy=BF 로 기록 -> 토스 자동매수 봇(bot.py)이 자동 승인
   -> monitor.py 가 즉시 시장가 매수, 손절·익절 조건주문, 60분 지나면·전량 청산 시각에 청산
 [모의] paper_price_ranges (예 $10~20) 돌파는 strategy=BF_PAPER 로만 기록 (bot.py 가 받지 않음 = 주문 없음).
@@ -28,11 +29,12 @@ import pandas as pd
 import bf_core as BC
 import fl_core as FC
 from fl_core import KST_S, MIN, clk, day_windows, iso, now_et, regular_1m, round_near
+from toss_quote import TossQuote
 
 QUEUE = os.path.join(FC.STATE_DIR, "fl_signal_queue.jsonl")
 PAPER_FILE = os.path.join(FC.STATE_DIR, "bf_paper_results.jsonl")
 FLOAT_FILE = os.path.join(FC.HERE, "cache", "bf_float.json")
-SCAN_SEC, HOT_SEC = 120, 5
+SCAN_SEC, HOT_SEC, TOSS_HOT_SEC = 120, 5, 2       # 돌파 확인: 야후 5초 / 토스 실시간 2초
 
 
 def paper_outcome(bars, s, cfg, W):
@@ -57,13 +59,45 @@ def _pb():
 class BFLive:
     def __init__(self, cfg, check=False):
         self.c, self.check = cfg, check
-        self.lo, self.hi = float(cfg["entry_min_price"]), float(cfg["entry_max_price"])   # 진입가 범위 (bf_config.json)
+        self.ranges = [(float(a), float(b)) for a, b in (cfg.get("entry_price_ranges")
+                                                          or [[cfg["entry_min_price"], cfg["entry_max_price"]]])]   # 실전 진입가
         self.paper = [(float(a), float(b)) for a, b in (cfg.get("paper_price_ranges") or [])]   # 모의만 (주문 없음)
+        self.toss = TossQuote()
+        self.toss_err_t = 0.0
         self.cands, self.ready, self.fired, self.uni = {}, {}, set(), {}
         self.floats = json.load(open(FLOAT_FILE, encoding="utf-8")) if os.path.exists(FLOAT_FILE) else {}
         self.logf = None
         self.last_min = None
         self.next_scan = None
+
+    @staticmethod
+    def rng_text(rs):
+        return ", ".join(f"${a:g}~{b:g}" for a, b in rs)
+
+    def in_live(self, p):
+        return any(a <= p < b for a, b in self.ranges)
+
+    def quote(self, tks, W):
+        """현재가 {종목: (가격, 출처)} - 토스 실시간 (서버), 안 되는 종목만 야후 1분봉 마지막 종가"""
+        out = {}
+        if self.toss.available():
+            for tk in tks:
+                try:
+                    out[tk] = (self.toss.price(tk), "토스")
+                except Exception as e:
+                    if time.time() - self.toss_err_t > 60:             # 오류 로그는 1분에 한 번만
+                        self.toss_err_t = time.time()
+                        self.log(f"{tk} 토스 현재가 실패 → 야후로 확인: {type(e).__name__}: {e}")
+                    if not self.toss.available():
+                        break
+        rest = [tk for tk in tks if tk not in out]
+        if rest:
+            data = _pb().download(rest, period="1d", interval="1m", prepost=False)
+            for tk in rest:
+                bars = regular_1m(data.get(tk), W)
+                if not bars.empty:
+                    out[tk] = (float(bars["Close"].iat[-1]), "야후")
+        return out
 
     def log(self, msg):
         n = now_et()
@@ -164,7 +198,7 @@ class BFLive:
             if not P["pb_vol"] <= cfg["pb_vol_ratio"] * P["pole_vol"]:     # V2 눌림 거래량
                 continue
             trig = P["trigger"]
-            if not (self.lo * 0.99 <= trig < self.hi or any(a * 0.99 <= trig < b for a, b in self.paper)):
+            if not any(a * 0.99 <= trig < b for a, b in self.ranges + self.paper):
                 continue
             ready[tk] = dict(P, key=key, ema=float(F["ema"].iat[-1]), vwap=float(F["vwap"].iat[-1]),
                              chg=float(F["chg"].iat[-1]), rvol=float(F["rvol"].iat[-1]) if F["rvol"].iat[-1] == F["rvol"].iat[-1] else None,
@@ -174,36 +208,35 @@ class BFLive:
         self.ready = ready
 
     def hot(self, now, W):
-        """5초마다 READY 종목 현재가 -> 기준가 돌파면 신호 (깃대마다 1번)"""
+        """2초(토스)·5초(야후)마다 READY 종목 현재가 -> 기준가 돌파면 신호 (깃대마다 1번)"""
         if not self.ready or not (W["buy_start"] <= now <= W["buy_end"]):
             return
-        data = _pb().download(list(self.ready), period="1d", interval="1m", prepost=False)
+        px = self.quote(list(self.ready), W)
         cfg = self.c
         for tk, R in list(self.ready.items()):
-            bars = regular_1m(data.get(tk), W)
-            if bars.empty:
+            if tk not in px:
                 continue
-            p = float(bars["Close"].iat[-1])
+            p, src = px[tk]
             T = R["trigger"]
             if p <= T:
                 continue
             self.fired.add(R["key"])
             self.ready.pop(tk)
             why = None
-            paper = not (self.lo <= p < self.hi) and any(a <= p < b for a, b in self.paper)
+            paper = not self.in_live(p) and any(a <= p < b for a, b in self.paper)
             if p > T * (1 + cfg["max_chase_pct"] / 100):
-                why = f"기준가 +{cfg['max_chase_pct']:g}% 초과 (${p:.4g} / 기준가 ${T:.4g}) - 추격 안 함"
-            elif not (self.lo <= p < self.hi) and not paper:
-                why = f"진입가 ${p:.4g} 가 ${self.lo:g}~{self.hi:g} 밖"
+                why = f"기준가 +{cfg['max_chase_pct']:g}% 초과 ({src} ${p:.4g} / 기준가 ${T:.4g}) - 추격 안 함"
+            elif not self.in_live(p) and not paper:
+                why = f"진입가 ${p:.4g} 가 {self.rng_text(self.ranges)} 밖"
             elif not (p > R["ema"] > R["vwap"]):
                 why = f"현재가 > 9EMA > VWAP 아님 (현재가 {p:.4g}, EMA {R['ema']:.4g}, VWAP {R['vwap']:.4g})"
             if why:
                 self.log(f"{tk} 돌파 탈락: {why}")
                 continue
-            self.emit(tk, R, p, now, paper=paper)
+            self.emit(tk, R, p, now, paper=paper, src=src)
 
-    def emit(self, tk, R, p, now, paper=False):
-        rec = dict(strategy="BF_PAPER" if paper else "BF", tk=tk, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
+    def emit(self, tk, R, p, now, paper=False, src=""):
+        rec = dict(strategy="BF_PAPER" if paper else "BF", tk=tk, px_src=src, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
                    t=iso(now.floor("min")), t_sig=iso(now), t_detect=iso(now), px=round(p, 6), L=float(R["pb_low"]),
                    SL=round_near(p * (1 - self.c["sl_pct"] / 100)), TP=round_near(p * (1 + self.c["tp_pct"] / 100)),
                    sl_pct=self.c["sl_pct"], tp_pct=self.c["tp_pct"], chg=round(R["chg"], 2),
@@ -211,7 +244,7 @@ class BFLive:
                    trigger=float(R["trigger"]), pole_start=float(R["start"]), pole_high=float(R["high"]),
                    pole_pct=round((R["high"] / R["start"] - 1) * 100, 2), retr=round(float(R["retr"]), 1),
                    pb_bars=len(R["pb"]))
-        self.log(f"{'📝 [모의 · 주문 없음] ' if paper else '🚩 '}{tk} Bull Flag 돌파 신호 ${p:.4g} (기준가 ${R['trigger']:.4g}, "
+        self.log(f"{'📝 [모의 · 주문 없음] ' if paper else '🚩 '}{tk} Bull Flag 돌파 신호 {src} ${p:.4g} (기준가 ${R['trigger']:.4g}, "
                  f"깃대 +{rec['pole_pct']:.1f}%, 되돌림 {rec['retr']:.0f}%, 눌림 {rec['pb_bars']}봉)")
         if self.check:
             return
@@ -234,8 +267,17 @@ class BFLive:
             self.log("오늘 장이 끝났습니다 - 종료")
             return
         self.uni = load_universe()
-        self.log(f"Bull Flag V2 실시간 신호 시작 | 진입 ${self.lo:g}~{self.hi:g} · 익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}% | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
-                 f"유통주식 캐시 {len(self.floats)}종목")
+        tq = "?"
+        if self.toss.enabled:
+            try:
+                tq = f"OK (SPY ${self.toss.price('SPY'):.2f})"
+            except Exception as e:
+                tq = f"실패 → 야후 사용 ({type(e).__name__}: {e})"
+        self.log(f"Bull Flag V2 실시간 신호 시작 | 진입 {self.rng_text(self.ranges)}"
+                 + (f" (모의 {self.rng_text(self.paper)})" if self.paper else "")
+                 + f" · 익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}% | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
+                 f"돌파 확인 " + (f"토스 실시간 {TOSS_HOT_SEC}초 - {tq}" if self.toss.enabled else f"야후 {HOT_SEC}초 (토스 키 없음)")
+                 + f" | 유통주식 캐시 {len(self.floats)}종목")
         start = W["open"] + MIN + pd.Timedelta(seconds=5)
         while now_et() < start:
             time.sleep(min(30, max(1, (start - now_et()).total_seconds())))
@@ -266,7 +308,8 @@ class BFLive:
                 except Exception as e:
                     self.log(f"{name} 오류 (다음 주기에 다시): {type(e).__name__}: {e}")
                     traceback.print_exc()
-            time.sleep(max(1.0, HOT_SEC - (now_et() - now).total_seconds()))
+            gap = TOSS_HOT_SEC if (self.ready and self.toss.available()) else HOT_SEC
+            time.sleep(max(1.0, gap - (now_et() - now).total_seconds()))
 
     def paper_review(self, W):
         """오늘 모의(BF_PAPER) 신호 채점 -> state/bf_paper_results.jsonl + 텔레그램 요약(BF_PAPER_RESULT, bot.py 가 보냄)"""
