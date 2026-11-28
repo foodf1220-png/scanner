@@ -13,8 +13,9 @@ bf_live.py - Bull Flag V2 실시간 신호 (서버 bf-live.service, 평일 뉴�
 [모의] paper_price_ranges (예 $10~20) 돌파는 strategy=BF_PAPER 로만 기록 (bot.py 가 받지 않음 = 주문 없음).
        장 끝나면 그날 모의 신호를 백테스트와 같은 방식(bf_core.sim_signal)으로 채점 -> state/bf_paper_results.jsonl,
        요약은 strategy=BF_PAPER_RESULT 로 신호 파일에 남겨 bot.py 가 텔레그램으로 보냄
-[연구] research.enabled 면 실전 신호(BF)마다 bf_research.Research 가 버전 여러 개를 가상 매매 (주문 없음)
-       -> 🧪 모의매매 텔레그램(알림설정.json)으로 진입·청산·장 마감 요약
+[연구] research.enabled 면 bf_research.Research 가 가상 매매 (주문 없음): 실전 신호(BF) + 실전 범위 밖이지만
+       research.price_ranges 안의 돌파(strategy=BF_RESEARCH, bot.py 가 받지 않음)
+       -> 🧪 모의매매 텔레그램(알림설정.json)으로 가상 매수·청산·장 마감 요약
 [실행] python bf_live.py          실시간 (서비스)
        python bf_live.py --check  최근 장으로 한 번 검색만 (신호 안 씀)
 """
@@ -73,6 +74,8 @@ class BFLive:
         self.last_min = None
         self.next_scan = None
         self.research = Research(cfg, self.log, dry=check) if (cfg.get("research") or {}).get("enabled") else None
+        self.rsch = self.research.ranges if self.research else []     # 연구판 모의만 보는 진입가 범위 (실전 밖 포함)
+        self.loop_n = 0
 
     @staticmethod
     def rng_text(rs):
@@ -202,7 +205,7 @@ class BFLive:
             if not P["pb_vol"] <= cfg["pb_vol_ratio"] * P["pole_vol"]:     # V2 눌림 거래량
                 continue
             trig = P["trigger"]
-            if not any(a * 0.99 <= trig < b for a, b in self.ranges + self.paper):
+            if not any(a * 0.99 <= trig < b for a, b in self.ranges + self.paper + self.rsch):
                 continue
             ready[tk] = dict(P, key=key, ema=float(F["ema"].iat[-1]), vwap=float(F["vwap"].iat[-1]),
                              chg=float(F["chg"].iat[-1]), rvol=float(F["rvol"].iat[-1]) if F["rvol"].iat[-1] == F["rvol"].iat[-1] else None,
@@ -215,7 +218,11 @@ class BFLive:
         """2초(토스)·5초(야후)마다 READY 종목 현재가 -> 기준가 돌파면 신호 (깃대마다 1번)"""
         if not self.ready or not (W["buy_start"] <= now <= W["buy_end"]):
             return
-        px = self.quote(list(self.ready), W)
+        self.loop_n += 1
+        near_live = lambda R: any(a * 0.99 <= R["trigger"] < b for a, b in self.ranges + self.paper)
+        main = [tk for tk, R in self.ready.items() if near_live(R)]
+        extra = [tk for tk in self.ready if tk not in main]          # 연구판 모의만: 토스 호출을 아끼려고 한 번 걸러 확인
+        px = self.quote(main + (extra if self.loop_n % 2 == 0 else []), W)
         cfg = self.c
         for tk, R in list(self.ready.items()):
             if tk not in px:
@@ -228,19 +235,21 @@ class BFLive:
             self.ready.pop(tk)
             why = None
             paper = not self.in_live(p) and any(a <= p < b for a, b in self.paper)
+            rs = not self.in_live(p) and not paper and any(a <= p < b for a, b in self.rsch)
             if p > T * (1 + cfg["max_chase_pct"] / 100):
                 why = f"기준가 +{cfg['max_chase_pct']:g}% 초과 ({src} ${p:.4g} / 기준가 ${T:.4g}) - 추격 안 함"
-            elif not self.in_live(p) and not paper:
+            elif not self.in_live(p) and not paper and not rs:
                 why = f"진입가 ${p:.4g} 가 {self.rng_text(self.ranges)} 밖"
             elif not (p > R["ema"] > R["vwap"]):
                 why = f"현재가 > 9EMA > VWAP 아님 (현재가 {p:.4g}, EMA {R['ema']:.4g}, VWAP {R['vwap']:.4g})"
             if why:
                 self.log(f"{tk} 돌파 탈락: {why}")
                 continue
-            self.emit(tk, R, p, now, paper=paper, src=src)
+            self.emit(tk, R, p, now, paper=paper, src=src, research=rs)
 
-    def emit(self, tk, R, p, now, paper=False, src=""):
-        rec = dict(strategy="BF_PAPER" if paper else "BF", tk=tk, px_src=src, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
+    def emit(self, tk, R, p, now, paper=False, src="", research=False):
+        strat = "BF_PAPER" if paper else "BF_RESEARCH" if research else "BF"     # BF 만 실전 주문 (bot.py ACCEPT_STRATEGY)
+        rec = dict(strategy=strat, tk=tk, px_src=src, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
                    t=iso(now.floor("min")), t_sig=iso(now), t_detect=iso(now), px=round(p, 6), L=float(R["pb_low"]),
                    SL=round_near(p * (1 - self.c["sl_pct"] / 100)), TP=round_near(p * (1 + self.c["tp_pct"] / 100)),
                    sl_pct=self.c["sl_pct"], tp_pct=self.c["tp_pct"], chg=round(R["chg"], 2),
@@ -248,7 +257,8 @@ class BFLive:
                    trigger=float(R["trigger"]), pole_start=float(R["start"]), pole_high=float(R["high"]),
                    pole_pct=round((R["high"] / R["start"] - 1) * 100, 2), retr=round(float(R["retr"]), 1),
                    pb_bars=len(R["pb"]))
-        self.log(f"{'📝 [모의 · 주문 없음] ' if paper else '🚩 '}{tk} Bull Flag 돌파 신호 {src} ${p:.4g} (기준가 ${R['trigger']:.4g}, "
+        tag = '📝 [모의 · 주문 없음] ' if paper else '🧪 [연구 모의 · 주문 없음] ' if research else '🚩 '
+        self.log(f"{tag}{tk} Bull Flag 돌파 신호 {src} ${p:.4g} (기준가 ${R['trigger']:.4g}, "
                  f"깃대 +{rec['pole_pct']:.1f}%, 되돌림 {rec['retr']:.0f}%, 눌림 {rec['pb_bars']}봉)")
         if self.check:
             return
@@ -291,8 +301,7 @@ class BFLive:
                  + f" · 익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}% | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
                  f"돌파 확인 " + (f"토스 실시간 {TOSS_HOT_SEC}초 - {tq}" if self.toss.enabled else f"야후 {HOT_SEC}초 (토스 키 없음)")
                  + f" | 유통주식 캐시 {len(self.floats)}종목"
-                 + (" | 연구판 모의 " + ", ".join(f"{v['id']}{v['name']} +{v['tp_pct']:g}/-{v['sl_pct']:g}"
-                                             for v in self.research.variants) if self.research else ""))
+                 + (" | 연구판 모의 " + self.research.describe() if self.research else ""))
         start = W["open"] + MIN + pd.Timedelta(seconds=5)
         while now_et() < start:
             time.sleep(min(30, max(1, (start - now_et()).total_seconds())))

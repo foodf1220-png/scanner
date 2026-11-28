@@ -2,18 +2,16 @@
 """
 bf_research.py - 연구판 모의매매 (bf_live.py 안에서 같이 돎, 실제 주문 없음)
 
-실전과 같은 신호(strategy=BF)를 받아 여러 버전을 동시에 가상 매매 (bf_config.json 의 research):
-  ① 기준선 = 실전 규칙 (익절 +5 / 손절 -4, 종목 수 제한 없음)
-  ② 승률형 = 익절 +3 / 손절 -4
-  ③ 재진입 = 그날 같은 종목의 2번째 이후 신호만 (익절 +5 / 손절 -4)
+bf_live 의 Bull Flag 돌파 신호를 받아 가상 매매 (bf_config.json 의 research):
+  신호 범위: research.price_ranges (기본 $0.5~20 = 검색기 전 구간). 실전 범위($1~3·$10~20) 신호도, 그 밖 신호도 모두
+  버전: research.variants (기본 승률형 하나 = 익절 +3 / 손절 -4, 같은 종목 재진입 포함, 가상 보유 중이면 안 삼)
 진입: 신호 가격(토스 현재가) + 가격대별 슬리피지
 청산: 몇 초마다 현재가 확인 -> 손절·익절가에 닿으면 그 가격에서 슬리피지만큼 낮게 (토스 조건주문 = 닿으면 시장가),
       진입 후 max_hold_min 분, 전량 청산 시각 (bf_live 와 같음)
 비용: 수수료 편도 research.fee_pct (토스 0.1%)
-같은 버전에서 이미 들고 있는 종목은 다시 안 삼 (실전 봇과 같음)
 알림: 🧪 모의매매 텔레그램 - 환경변수 PAPER_TELEGRAM_TOKEN / PAPER_TELEGRAM_CHAT_ID, 없으면 알림설정.json
       (실전 봇 TELEGRAM_TOKEN 은 쓰지 않음 -> 실전 채팅과 섞이지 않음)
-기록: state/research_state.json (열린 가상 포지션·오늘 신호 수, 재시작해도 이어감), state/research_trades.jsonl (끝난 거래)
+기록: state/research_state.json (열린 가상 포지션·오늘 신호, 재시작해도 이어감), state/research_trades.jsonl (끝난 거래)
 """
 import json
 import os
@@ -30,6 +28,7 @@ STATE_FILE = os.path.join(FC.STATE_DIR, "research_state.json")
 TRADES_FILE = os.path.join(FC.STATE_DIR, "research_trades.jsonl")
 ALERT_FILE = os.path.join(FC.HERE, "알림설정.json")
 WHY_KO = {"tp": "익절", "sl": "손절", "time": "시간 청산", "flat": "장 마감 청산"}
+PRICE_BUCKETS = [(0, 1, "$1 미만"), (1, 3, "$1~3"), (3, 10, "$3~10"), (10, 20, "$10~20"), (20, 1e9, "$20 이상")]
 
 
 def paper_telegram_conf():
@@ -47,11 +46,16 @@ def money(x):
     return FC.money(x)
 
 
+def bucket(px):
+    return next(name for a, b, name in PRICE_BUCKETS if a <= px < b)
+
+
 class Research:
     def __init__(self, cfg, log=print, dry=False, state_file=STATE_FILE, trades_file=TRADES_FILE, sender=None):
         self.c = cfg
         r = cfg["research"]
         self.variants = r["variants"]
+        self.ranges = [(float(a), float(b)) for a, b in (r.get("price_ranges") or [])]
         self.fee = float(r.get("fee_pct", 0.1)) / 100
         self.tick_sec = float(r.get("tick_sec", 3))
         self.max_hold = float(cfg.get("max_hold_min") or 0)
@@ -62,6 +66,13 @@ class Research:
         self.open, self.nth, self.signals = [], {}, []
         self.last_tick = 0.0
         self.last_px = {}
+
+    def label(self, v):
+        return f"{v['id']} {v['name']}".strip()
+
+    def describe(self):
+        rng = ", ".join(f"${a:g}~{b:g}" for a, b in self.ranges)
+        return ", ".join(f"{self.label(v)} +{v['tp_pct']:g}/-{v['sl_pct']:g}" for v in self.variants) + (f" · {rng}" if rng else "")
 
     # ───────── 상태 저장 ─────────
     def start_day(self, d):
@@ -115,28 +126,40 @@ class Research:
     # ───────── 신호 -> 가상 매수 ─────────
     def on_signal(self, rec, now):
         tk, px = rec["tk"], float(rec["px"])
+        live = rec.get("strategy") == "BF"
         n = self.nth.get(tk, 0) + 1
         self.nth[tk] = n
-        self.signals.append(dict(tk=tk, t=rec["t"], px=px))
+        self.signals.append(dict(tk=tk, t=rec["t"], px=px, live=live))
         sb = FC.slip_pct(px, self.c) / 100
         E = px * (1 + sb)
-        lines = [f"🧪 연구 신호 · {tk} {money(px)} ({rec.get('px_src') or '?'}) · 오늘 {n}번째 신호"]
+        bought, skipped = [], []
         for v in self.variants:
-            tag = f"{v['id']} {v['name']}"
             if v.get("only_reentry") and n < 2:
-                lines.append(f"{tag}  - 오늘 첫 신호라 안 삼")
+                skipped.append(f"{self.label(v)}  - 오늘 첫 신호라 안 삼")
                 continue
             if any(p["v"] == v["id"] and p["tk"] == tk for p in self.open):
-                lines.append(f"{tag}  - 이미 보유 중이라 안 삼")
+                skipped.append(f"{self.label(v)}  - 이미 가상 보유 중이라 안 삼")
                 continue
             TP, SL = round_near(E * (1 + v["tp_pct"] / 100)), round_near(E * (1 - v["sl_pct"] / 100))
             self.open.append(dict(v=v["id"], name=v["name"], tk=tk, t_in=iso(now), px=px, E=E, TP=TP, SL=SL, nth=n,
-                                  src=rec.get("px_src") or ""))
-            lines.append(f"{tag}  매수 {money(E)} → 익절 {money(TP)} / 손절 {money(SL)}")
-        lines.append("(가상 매매 · 실제 주문 없음)")
-        lines.append("")
-        lines += self.cum_lines()
+                                  live=live, src=rec.get("px_src") or ""))
+            bought.append((v, TP, SL))
         self.save()
+        if not bought:                                     # 전부 보유 중 등으로 안 산 신호: 알림 없이 기록만
+            self.log(f"[연구] {tk} 신호 - 가상 매수 없음 ({'; '.join(skipped)})")
+            return
+        where = "실전 범위 · 실전 봇에도 같은 신호" if live else "실전 범위 밖 · 모의만"
+        nth = f"오늘 {n}번째 신호" + (" (재진입)" if n >= 2 else "")
+        if len(self.variants) == 1:
+            v, TP, SL = bought[0]
+            lines = [f"🧪 {v['name']} 가상 매수 · {tk} {money(px)} ({rec.get('px_src') or '?'})",
+                     f"매수 {money(E)} → 익절 {money(TP)} (+{v['tp_pct']:g}%) / 손절 {money(SL)} (-{v['sl_pct']:g}%)",
+                     f"{nth} · {where}"]
+        else:
+            lines = [f"🧪 연구 신호 · {tk} {money(px)} ({rec.get('px_src') or '?'}) · {nth} · {where}"]
+            lines += [f"{self.label(v)}  매수 {money(E)} → 익절 {money(TP)} / 손절 {money(SL)}" for v, TP, SL in bought]
+            lines += skipped
+        lines += ["(가상 매매 · 실제 주문 없음)", ""] + self.cum_lines()
         self.send("\n".join(lines))
 
     # ───────── 청산 확인 ─────────
@@ -145,7 +168,8 @@ class Research:
         ret = (X * (1 - self.fee)) / (p["E"] * (1 + self.fee)) - 1
         hold = (pd.Timestamp(now) - pd.Timestamp(p["t_in"])).total_seconds() / 60
         row = dict(day=self.day, v=p["v"], name=p["name"], tk=p["tk"], t_in=p["t_in"], t_out=iso(now), px=p["px"],
-                   E=round(p["E"], 6), X=round(X, 6), ret=round(ret * 100, 3), why=why, hold=round(hold, 1), nth=p["nth"])
+                   E=round(p["E"], 6), X=round(X, 6), ret=round(ret * 100, 3), why=why, hold=round(hold, 1), nth=p["nth"],
+                   live=p.get("live"))
         if not (self.dry and self.trades_file == TRADES_FILE):
             os.makedirs(os.path.dirname(self.trades_file), exist_ok=True)
             with open(self.trades_file, "a", encoding="utf-8") as f:
@@ -164,15 +188,14 @@ class Research:
             self.last_px[tk] = px
         flat = now >= W["flat"]
         done = []
+        slip = lambda x: x * (1 - FC.slip_pct(x, self.c) / 100)
         for p in list(self.open):
             px = q.get(p["tk"], (None, None))[0]
+            if px is None and flat:
+                px = self.last_px.get(p["tk"])
             if px is None:
-                if flat:
-                    px = self.last_px.get(p["tk"])
-                if px is None:
-                    continue
+                continue
             held = (pd.Timestamp(now) - pd.Timestamp(p["t_in"])).total_seconds() / 60
-            slip = lambda x: x * (1 - FC.slip_pct(x, self.c) / 100)
             if px <= p["SL"]:
                 done.append(self.close(p, slip(p["SL"]), "sl", now))
             elif px >= p["TP"]:
@@ -186,11 +209,11 @@ class Research:
             lines = []
             for r in done:
                 icon = "🟢" if r["ret"] > 0 else "🔴"
-                lines.append(f"🧪 {icon} {r['v']} {r['name']} {WHY_KO[r['why']]} · {r['tk']}  {r['ret']:+.2f}%")
+                lines.append(f"🧪 {icon} {self.label(dict(id=r['v'], name=r['name']))} {WHY_KO[r['why']]} · {r['tk']}  {r['ret']:+.2f}%")
                 lines.append(f"   {money(r['E'])} → {money(r['X'])} · 보유 {r['hold']:.0f}분")
             self.send("\n".join(lines))
 
-    # ───────── 장 마감 요약 ─────────
+    # ───────── 누적·장 마감 요약 ─────────
     def history(self):
         rows = []
         if os.path.exists(self.trades_file):
@@ -211,21 +234,25 @@ class Research:
         return (f"{len(rows)}건 {w}승 {len(rows) - w}패 (승률 {w / len(rows) * 100:.0f}%) "
                 f"평균 {tot / len(rows):+.2f}% · 합계 {tot:+.2f}%")
 
+    @staticmethod
+    def short(rows):
+        w = sum(r["ret"] > 0 for r in rows)
+        return f"수익률 {sum(r['ret'] for r in rows):+.2f}% · 승률 {w / len(rows) * 100:.0f}% ({w}승 {len(rows) - w}패)"
+
     def cum_lines(self):
-        """전체 누적 수익률 (끝난 거래의 거래별 수익률 합, 버전별) - 신호 알림 맨 끝"""
+        """전체 누적 수익률·승률 (끝난 거래의 거래별 수익률 합) - 신호 알림 맨 끝"""
         hist = self.history()
         if not hist:
             return ["📊 전체 누적: 아직 끝난 거래 없음 (첫 청산부터 표시)"]
         first = min(r["day"] for r in hist)
-        lines = [f"📊 전체 누적 ({first[5:].replace('-', '/')}부터 · 끝난 거래 기준)"]
+        head = f"📊 전체 누적 ({first[5:].replace('-', '/')}부터 · 끝난 거래 기준)"
+        if len(self.variants) == 1:
+            a = [r for r in hist if r["v"] == self.variants[0]["id"]]
+            return [head, self.short(a) if a else "거래 없음"]
+        lines = [head]
         for v in self.variants:
             a = [r for r in hist if r["v"] == v["id"]]
-            if not a:
-                lines.append(f"{v['id']} {v['name']}  거래 없음")
-                continue
-            w = sum(r["ret"] > 0 for r in a)
-            lines.append(f"{v['id']} {v['name']}  수익률 {sum(r['ret'] for r in a):+.2f}% · 승률 {w / len(a) * 100:.0f}% "
-                         f"({w}승 {len(a) - w}패)")
+            lines.append(f"{self.label(v)}  " + (self.short(a) if a else "거래 없음"))
         return lines
 
     def day_end(self, now, W, quote):
@@ -237,15 +264,26 @@ class Research:
         hist = self.history()
         today = [r for r in hist if r["day"] == self.day]
         days = sorted({r["day"] for r in hist})
-        sig = ", ".join(dict.fromkeys(s["tk"] for s in self.signals))
-        lines = [f"🧪 연구판 모의 결과 · {self.day}",
-                 f"실전 신호 {len(self.signals)}건" + (f" ({sig})" if sig else " - 오늘은 신호 없음"), ""]
+        n_live = sum(1 for s in self.signals if s.get("live"))
+        title = self.variants[0]["name"] if len(self.variants) == 1 else "연구판"
+        lines = [f"🧪 {title} 모의 결과 · {self.day}",
+                 (f"신호 {len(self.signals)}건 (실전 범위 {n_live} · 범위 밖 {len(self.signals) - n_live})"
+                  if self.signals else "오늘은 신호 없음"), ""]
         for v in self.variants:
             t = [r for r in today if r["v"] == v["id"]]
             a = [r for r in hist if r["v"] == v["id"]]
-            lines.append(f"{v['id']} {v['name']} (+{v['tp_pct']:g}/-{v['sl_pct']:g}{', 재진입만' if v.get('only_reentry') else ''})")
-            lines.append(f"   오늘 {self.stat(t)}")
-            lines.append(f"   누적 {len(days)}일 {self.stat(a)}")
-        lines.append("")
+            if len(self.variants) > 1:
+                lines.append(f"{self.label(v)} (+{v['tp_pct']:g}/-{v['sl_pct']:g}{', 재진입만' if v.get('only_reentry') else ''})")
+            lines.append(f"오늘 {self.stat(t)}")
+            lines.append(f"누적 {len(days)}일 {self.stat(a)}")
+            if a:
+                lines.append("")
+                lines.append("가격대별 누적")
+                for _, _, name in PRICE_BUCKETS:
+                    g = [r for r in a if bucket(r["px"]) == name]
+                    if g:
+                        lines.append(f"  {name}  {len(g)}건 승률 {sum(r['ret'] > 0 for r in g) / len(g) * 100:.0f}% "
+                                     f"합계 {sum(r['ret'] for r in g):+.2f}%")
+            lines.append("")
         lines.append(f"(가상 매매 · 수수료 {self.fee * 100:g}%·슬리피지 반영 · 실제 주문 없음)")
         self.send("\n".join(lines))
