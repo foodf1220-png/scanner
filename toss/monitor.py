@@ -363,15 +363,18 @@ def ensure_day(token, positions):
 
 
 def add_realized(symbol, pos, exit_px):
-    """청산 확인 때 실현 손익 추정 (청산 추정가 - 매수가) x 수량"""
+    """청산 확인 때 실현 손익 추정 (청산 추정가 - 매수가) x 수량 + 오늘 승·패. 반환: 오늘 기록 (알림용) 또는 None"""
     if not exit_px or not pos.get("buy_price"):
-        return
+        return None
     d = load_day()
     if d.get("date") != f"{datetime.now(ET):%Y-%m-%d}":
-        return
+        return None
     pnl = (float(exit_px) - float(pos["buy_price"])) * float(pos.get("quantity") or 0)
     d["realized"] = round(float(d.get("realized") or 0) + pnl, 2)
+    k = "wins" if pnl > 0 else "losses"
+    d[k] = int(d.get(k) or 0) + 1
     save_day(d)
+    return d
 
 
 def account_check(token, positions):
@@ -428,7 +431,7 @@ def liquidate_locked(token, symbol, pos, why):
         qty_now, _ = get_holding(token, pos["account_seq"], symbol)
         if qty_now is not None and qty_now - float(pos.get("base_qty") or 0) < 1:
             return resolve_closed(token, symbol, pos)
-        start_close(token, symbol, pos, f"{why} → 전량 청산")
+        start_close(token, symbol, pos, f"{why} → 전량 청산", kind="acct")
     elif st == "CLOSING":
         handle_closing(token, symbol, pos)
 
@@ -538,6 +541,39 @@ def pnl_text(E, px):
     return f"{(px / E - 1) * 100:+.2f}%" if E else ""
 
 
+def usd(x):
+    return f"{'+' if x >= 0 else '-'}${abs(x):.2f}"
+
+
+def exit_label(kind, why=""):
+    return {"tp": "익절", "sl": "손절", "be": "본전 손절", "time": f"시간 청산 ({MAX_HOLD_MIN:g}분)",
+            "acct": f"계좌 -{ACCOUNT_STOP_PCT:g}% 청산", "flat": why or "전량 청산"}.get(kind, "청산")
+
+
+def exit_report(symbol, pos, px, kind, how):
+    """청산 결과 알림 - 첫 줄에 결과(🟢 수익 / 🔴 손실, 사유, 수익률, 금액), 아래에 매수→매도 · 보유 시간 · 오늘 실현 손익"""
+    E, q = float(pos.get("buy_price") or 0), float(pos.get("quantity") or 0)
+    d = add_realized(symbol, pos, px)
+    label = exit_label(kind, pos.get("close_reason") or "")
+    if E and px:
+        pnl = (px - E) * q
+        dot = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
+        lines = [f"{dot} <b>{html.escape(label)}</b> · {b(symbol)}   <b>{pnl_text(E, px)}</b>  ({usd(pnl)})",
+                 f"매수 ${fmt_px(E)} → 매도 약 ${fmt_px(px)} · {q:g}주"]
+    else:
+        lines = [f"⚪ <b>{html.escape(label)}</b> · {b(symbol)}", f"매수 ${fmt_px(E)} · {q:g}주 (매도가 확인 실패 - 토스 앱 확인)"]
+    held = ""
+    if pos.get("filled_at"):
+        held = f"보유 {(datetime.now(timezone.utc) - datetime.fromisoformat(pos['filled_at'])).total_seconds() / 60:.0f}분 · "
+    lines.append(held + html.escape(how))
+    if d and d.get("start_eq"):
+        r = float(d.get("realized") or 0)
+        lines.append(f"오늘 실현 {usd(r)} ({r / float(d['start_eq']) * 100:+.2f}%) · {int(d.get('wins') or 0)}승 "
+                     f"{int(d.get('losses') or 0)}패")
+    lines.append("<i>수수료 전 추정</i>")
+    send_message(pos["chat_id"], "\n".join(lines))
+
+
 def manage_open(token, symbol, pos):
     """OPEN / BREAKEVEN 관리 (체결 직후에도 바로 호출)
     1) 보유 0 -> 정리·알림   2) 정규장 밖 -> 조건주문 전부 취소 (장 열리면 재등록)   3) 마감 10분 전 -> 시장가 청산
@@ -564,11 +600,11 @@ def manage_open(token, symbol, pos):
             log(f"{symbol} 정규장 외 대기 (조건주문 없음)")
         return
     if is_flatten_time():
-        return start_close(token, symbol, pos, flatten_reason(datetime.now(ET)))
+        return start_close(token, symbol, pos, flatten_reason(datetime.now(ET)), kind="flat")
     if MAX_HOLD_MIN and pos.get("filled_at"):                     # 진입 후 60분 지나면 시장가 청산
         held = (datetime.now(timezone.utc) - datetime.fromisoformat(pos["filled_at"])).total_seconds() / 60
         if held >= MAX_HOLD_MIN:
-            return start_close(token, symbol, pos, f"진입 {MAX_HOLD_MIN:g}분 경과 청산")
+            return start_close(token, symbol, pos, f"진입 {MAX_HOLD_MIN:g}분 경과", kind="time")
 
     SL, TP = pos.get("SL"), pos.get("TP")
     if SL is None or TP is None:
@@ -598,9 +634,11 @@ def manage_open(token, symbol, pos):
         if alive or alive is None:                                   # 살아 있음 / 확인 실패면 이번엔 그대로
             continue
         if kind == "sl" and price <= trig:                           # 방향이 반대로 등록될 위험 -> 즉시 매도
-            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 손절가 ${fmt_px(trig)} 이하 → 즉시 시장가 매도")
+            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 손절가 ${fmt_px(trig)} 이하 → 즉시 시장가 매도",
+                               kind="be" if pos.get("status") == "BREAKEVEN" else "sl")
         if kind == "tp" and price >= trig:
-            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 익절가 ${fmt_px(trig)} 이상 → 즉시 시장가 매도")
+            return start_close(token, symbol, pos, f"현재가 ${price:.2f} 가 이미 익절가 ${fmt_px(trig)} 이상 → 즉시 시장가 매도",
+                               kind="tp")
         try:
             new[f"{kind}_id"] = place_conditional_sell(token, acc, symbol, qty, trig)
         except Exception as e:
@@ -627,8 +665,9 @@ def manage_open(token, symbol, pos):
         send_message(pos["chat_id"], f"⚠️ {b(symbol)} {', '.join(failed)} 조건주문 등록 실패 - 1분마다 다시 시도해요")
 
 
-def start_close(token, symbol, pos, why):
-    """시장가 매도로 청산 시작 -> CLOSING. 매도가 성공한 뒤에 조건주문 취소 (실패해도 손절·익절 보호 유지)"""
+def start_close(token, symbol, pos, why, kind="other"):
+    """시장가 매도로 청산 시작 -> CLOSING. 매도가 성공한 뒤에 조건주문 취소 (실패해도 손절·익절 보호 유지)
+    kind: tp / sl / be / time / flat / acct / other (체결 확인 후 결과 알림 제목)"""
     acc, E = pos["account_seq"], float(pos.get("buy_price") or 0)
     qty_now, _ = get_holding(token, acc, symbol)
     if qty_now is None:
@@ -663,11 +702,11 @@ def start_close(token, symbol, pos, why):
         price = get_current_price(token, symbol)
     except Exception:
         price = 0.0
-    update_position(symbol, status="CLOSING", close_reason=why, sell_order_id=oid, sell_qty=held,
+    update_position(symbol, status="CLOSING", close_reason=why, close_kind=kind, sell_order_id=oid, sell_qty=held,
                     closing_at=now_iso(), close_ref_price=price, sl_id=None, tp_id=None)
     log(f"{symbol} 청산 매도 주문 {held}주 ({why})")
-    send_message(pos["chat_id"], f"⏰ {b(symbol)} {html.escape(why)}\n\n시장가 매도 주문 {held}주"
-                                 + (f" (현재가 약 ${price:.2f}, {pnl_text(E, price)})" if price else ""))
+    send_message(pos["chat_id"], f"⏰ {b(symbol)} {html.escape(exit_label(kind, why))} - 시장가 매도 {held}주"
+                                 + (f" (지금 {pnl_text(E, price)})" if price and E else "") + " · 체결되면 결과 알려드려요")
 
 
 def resolve_closed(token, symbol, pos):
@@ -675,22 +714,19 @@ def resolve_closed(token, symbol, pos):
     acc, E = pos["account_seq"], float(pos.get("buy_price") or 0)
     r = {k: cancel_conditional(token, acc, pos.get(f"{k}_id")) for k in ("sl", "tp")}
     if r["sl"] == "gone" and r["tp"] != "gone":
-        be = pos.get("status") == "BREAKEVEN"
-        why, px, mark = ("브레이크이븐 손절 실행 (조건주문)" if be else "손절 실행 (조건주문)"), float(pos.get("SL") or 0), \
-            ("🟰" if be else "🔻")
+        kind, px = ("be" if pos.get("status") == "BREAKEVEN" else "sl"), float(pos.get("SL") or 0)
+        how = "토스 손절 조건주문 실행"
     elif r["tp"] == "gone" and r["sl"] != "gone":
-        why, px, mark = "익절 실행 (조건주문)", float(pos.get("TP") or 0), "✅"
+        kind, px, how = "tp", float(pos.get("TP") or 0), "토스 익절 조건주문 실행"
     else:
-        why, mark = "청산 확인 (직접 매도했거나 조건주문 상태를 토스 앱에서 확인해주세요)", "ℹ️"
+        kind, how = "other", "직접 매도했거나 조건주문 상태 불명 - 토스 앱에서 확인해주세요"
         try:
             px = get_current_price(token, symbol)
         except Exception:
             px = 0.0
     clear_symbol(symbol)
-    add_realized(symbol, pos, px)
-    log(f"{symbol} {why} - 매수 ${E:.2f} → 약 ${px:.2f} (조건주문 취소 결과 {r})")
-    send_message(pos["chat_id"], f"{mark} {b(symbol)} {html.escape(why)}\n\n매수 ${E:.2f} → 약 ${px:.2f} "
-                                 f"({pnl_text(E, px)}, 수수료 전) × {float(pos.get('quantity') or 0):g}주\n남은 조건주문은 취소했어요.")
+    log(f"{symbol} {exit_label(kind)} ({how}) - 매수 ${E:.2f} → 약 ${px:.2f} (조건주문 취소 결과 {r})")
+    exit_report(symbol, pos, px, kind, how)
 
 
 def handle_closing(token, symbol, pos):
@@ -704,10 +740,8 @@ def handle_closing(token, symbol, pos):
         except Exception:
             px = float(pos.get("close_ref_price") or 0)
         clear_symbol(symbol)
-        add_realized(symbol, pos, px)
-        log(f"{symbol} 청산 완료 ({pos.get('close_reason')})")
-        send_message(pos["chat_id"], f"✅ {b(symbol)} 청산 완료 - {html.escape(str(pos.get('close_reason')))}\n\n"
-                                     f"매수 ${E:.2f} → 약 ${px:.2f} ({pnl_text(E, px)}, 수수료 전) × {pos.get('sell_qty')}주")
+        log(f"{symbol} 청산 완료 ({pos.get('close_reason')}) - 매수 ${E:.2f} → 약 ${px:.2f}")
+        exit_report(symbol, pos, px, pos.get("close_kind") or "other", f"시장가 매도 ({pos.get('close_reason')})")
         return
     minutes = (datetime.now(timezone.utc) - datetime.fromisoformat(pos.get("closing_at") or now_iso())).total_seconds() / 60
     log(f"{symbol} 청산 매도 체결 대기 ({minutes:.0f}분)")
