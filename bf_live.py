@@ -13,6 +13,8 @@ bf_live.py - Bull Flag V2 실시간 신호 (서버 bf-live.service, 평일 뉴�
 [모의] paper_price_ranges (예 $10~20) 돌파는 strategy=BF_PAPER 로만 기록 (bot.py 가 받지 않음 = 주문 없음).
        장 끝나면 그날 모의 신호를 백테스트와 같은 방식(bf_core.sim_signal)으로 채점 -> state/bf_paper_results.jsonl,
        요약은 strategy=BF_PAPER_RESULT 로 신호 파일에 남겨 bot.py 가 텔레그램으로 보냄
+[연구] research.enabled 면 실전 신호(BF)마다 bf_research.Research 가 버전 여러 개를 가상 매매 (주문 없음)
+       -> 🧪 모의매매 텔레그램(알림설정.json)으로 진입·청산·장 마감 요약
 [실행] python bf_live.py          실시간 (서비스)
        python bf_live.py --check  최근 장으로 한 번 검색만 (신호 안 씀)
 """
@@ -28,6 +30,7 @@ import pandas as pd
 
 import bf_core as BC
 import fl_core as FC
+from bf_research import Research
 from fl_core import KST_S, MIN, clk, day_windows, iso, now_et, regular_1m, round_near
 from toss_quote import TossQuote
 
@@ -69,6 +72,7 @@ class BFLive:
         self.logf = None
         self.last_min = None
         self.next_scan = None
+        self.research = Research(cfg, self.log, dry=check) if (cfg.get("research") or {}).get("enabled") else None
 
     @staticmethod
     def rng_text(rs):
@@ -251,6 +255,11 @@ class BFLive:
         os.makedirs(os.path.dirname(QUEUE), exist_ok=True)
         with open(QUEUE, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if self.research and not paper:                            # 연구판 가상 매매 (실전 신호 기록 뒤, 실패해도 실전과 무관)
+            try:
+                self.research.on_signal(rec, now)
+            except Exception as e:
+                self.log(f"[연구] 신호 처리 오류: {type(e).__name__}: {e}")
 
     def run(self):
         from scanner import load_universe
@@ -263,8 +272,12 @@ class BFLive:
         if W is None:
             self.log(f"{d} 미국 휴장일 - 종료")
             return
+        if self.research:
+            self.research.start_day(d)
         if now >= W["flat"]:
             self.log("오늘 장이 끝났습니다 - 종료")
+            if self.research and self.research.open:              # 청산 전에 재시작돼 남은 가상 포지션 정리·요약
+                self.research.day_end(now, W, self.quote)
             return
         self.uni = load_universe()
         tq = "?"
@@ -277,7 +290,9 @@ class BFLive:
                  + (f" (모의 {self.rng_text(self.paper)})" if self.paper else "")
                  + f" · 익절 +{cfg['tp_pct']:g}% / 손절 -{cfg['sl_pct']:g}% | 신규 {clk(W['buy_start'])}~{clk(W['buy_end'])} | "
                  f"돌파 확인 " + (f"토스 실시간 {TOSS_HOT_SEC}초 - {tq}" if self.toss.enabled else f"야후 {HOT_SEC}초 (토스 키 없음)")
-                 + f" | 유통주식 캐시 {len(self.floats)}종목")
+                 + f" | 유통주식 캐시 {len(self.floats)}종목"
+                 + (" | 연구판 모의 " + ", ".join(f"{v['id']}{v['name']} +{v['tp_pct']:g}/-{v['sl_pct']:g}"
+                                             for v in self.research.variants) if self.research else ""))
         start = W["open"] + MIN + pd.Timedelta(seconds=5)
         while now_et() < start:
             time.sleep(min(30, max(1, (start - now_et()).total_seconds())))
@@ -285,6 +300,12 @@ class BFLive:
             now = now_et()
             if now >= W["flat"]:
                 self.log(f"전량 청산 시각 {clk(W['flat'])} - 신호 종료 (청산은 monitor.py)")
+                if self.research:
+                    try:
+                        self.research.day_end(now, W, self.quote)
+                    except Exception as e:
+                        self.log(f"[연구] 장 마감 정리 오류: {type(e).__name__}: {e}")
+                        traceback.print_exc()
                 if self.paper:
                     time.sleep(75)                                 # 청산 시각 1분봉까지 받은 뒤 채점
                     try:
@@ -302,13 +323,16 @@ class BFLive:
                 self.last_min = bar
                 steps.append(("1분 갱신", lambda: self.minute(now, W)))
             steps.append(("돌파 확인", lambda: self.hot(now, W)))
+            if self.research and self.research.open:
+                steps.append(("연구 모의", lambda: self.research.tick(now, W, self.quote)))
             for name, fn in steps:
                 try:
                     fn()
                 except Exception as e:
                     self.log(f"{name} 오류 (다음 주기에 다시): {type(e).__name__}: {e}")
                     traceback.print_exc()
-            gap = TOSS_HOT_SEC if (self.ready and self.toss.available()) else HOT_SEC
+            busy = self.ready or (self.research and self.research.open)
+            gap = TOSS_HOT_SEC if (busy and self.toss.available()) else HOT_SEC
             time.sleep(max(1.0, gap - (now_et() - now).total_seconds()))
 
     def paper_review(self, W):

@@ -18,7 +18,8 @@
     "buy_start_et / buy_end_et / flatten_before_close_min": "신규 매수 뉴욕 09:31~15:30, 장 마감 10분 전 전량 청산",
     "force_exit_kst / max_hold_min": "사용자 지정: 한국 02:30 전량 청산 (신규 매수는 그 20분 전까지), 진입 후 60분 지나면 청산. 실전 주문은 서버 bot.env 의 FORCE_EXIT_KST / MAX_HOLD_MIN",
     "fee_pct / slippage_tiers / participation_pct": "수수료 매수·매도 각 0.25%, 슬리피지 가격대별, 1분 거래량 10% 까지만 체결",
-    "train_frac": "백테스트 학습 구간 비율 (날짜순 앞 60%). 나머지는 검증 구간 - 검증 구간으로는 조건을 고르지 않음"
+    "train_frac": "백테스트 학습 구간 비율 (날짜순 앞 60%). 나머지는 검증 구간 - 검증 구간으로는 조건을 고르지 않음",
+    "research": "연구판 모의 (bf_research.py, 주문 없음): 실전 신호마다 버전별 가상 매매 -> 🧪 모의매매 텔레그램. ① 기준선 +5/-4 = 실전 규칙, ② 승률형 +3/-4, ③ 재진입 = 그날 같은 종목 2번째 이후 신호만. 수수료 편도 fee_pct, 현재가 확인 tick_sec 초마다"
   },
   "trading_mode": "paper",
   "live_trading_enabled": false,
@@ -64,5 +65,15 @@
   "fee_pct": 0.25,
   "slippage_tiers": [[1.0, 0.5], [5.0, 0.2], [10.0, 0.1], [null, 0.05]],
   "participation_pct": 10.0,
-  "train_frac": 0.6
+  "train_frac": 0.6,
+  "research": {
+    "enabled": true,
+    "fee_pct": 0.1,
+    "tick_sec": 3,
+    "variants": [
+      {"id": "①", "name": "기준선", "tp_pct": 5.0, "sl_pct": 4.0, "only_reentry": false},
+      {"id": "②", "name": "승률형", "tp_pct": 3.0, "sl_pct": 4.0, "only_reentry": false},
+      {"id": "③", "name": "재진입", "tp_pct": 5.0, "sl_pct": 4.0, "only_reentry": true}
+    ]
+  }
 }
