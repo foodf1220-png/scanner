@@ -67,12 +67,12 @@ def load(cfg, P):
     path = os.path.join(CACHE, f"bf_bt_{days[0]:%Y%m%d}_{days[-1]:%Y%m%d}.pkl")
     bc = pd.read_pickle(path) if os.path.exists(path) else dict(m1={}, h5={})
     m1, h5 = bc["m1"], bc["h5"]
-    for f in sorted(os.listdir(CACHE)):                              # FL 백테스트 캐시 재사용
-        if f.startswith("fl_bt_") and f.endswith(".pkl"):
+    for f in sorted(os.listdir(CACHE)):                              # FL·예전 BF 백테스트 캐시 재사용 (야후 1분봉은 30일 지나면 못 받음)
+        if (f.startswith("fl_bt_") or f.startswith("bf_bt_")) and f.endswith(".pkl") and f != os.path.basename(path):
             fc = pd.read_pickle(os.path.join(CACHE, f))
             for tk in keep:
-                if tk in fc.get("m1", {}) and tk not in m1:
-                    m1[tk] = fc["m1"][tk]
+                if tk in fc.get("m1", {}):                             # 종목별로 합침 (기간이 다른 캐시끼리)
+                    m1[tk] = pd.concat([m1[tk], fc["m1"][tk]]) if tk in m1 else fc["m1"][tk]
                 if fc.get("h5", {}).get(tk) is not None and tk not in h5:
                     h5[tk] = fc["h5"][tk]
     need = {(tk, d) for tk, ds in keep.items() for d in ds if not has_day(m1.get(tk), d)}
@@ -87,7 +87,7 @@ def load(cfg, P):
                 m1[tk] = pd.concat([m1[tk], df]) if tk in m1 else df
         w = we
     m1 = {tk: df[~df.index.duplicated(keep="last")].sort_index() for tk, df in m1.items()}
-    miss5 = sorted(tk for tk in keep if h5.get(tk) is None)
+    miss5 = sorted(tk for tk in keep if h5.get(tk) is None or not has_day(h5[tk], max(keep[tk])))   # 마지막 후보일까지 있어야 함
     print(f"[5분봉] RVOL 14일·5분 EMA 용 {len(miss5)}종목 받기", flush=True)
     if miss5:
         s5 = max(days[0] - timedelta(days=30), FC.now_et().date() - timedelta(days=58))

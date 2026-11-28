@@ -314,7 +314,12 @@ def auto_approve(state, sid, message_id):
 
 
 def on_signal(state, s):
-    if s.get("strategy", "FL") not in ACCEPT:                 # 실전은 정한 전략만 (FL 모의 신호는 무시)
+    if s.get("strategy") == "BF_PAPER_RESULT":               # bf_live 모의($10~20) 하루 결과 - 알림만 (주문 없음)
+        if (now_utc() - ts(s["t_detect"])).total_seconds() < 6 * 3600:
+            send_message(TG_CHAT, s.get("text") or "📝 모의 결과 (내용 없음)")
+            log(f"모의 결과 알림 보냄 ({s.get('day')})")
+        return
+    if s.get("strategy", "FL") not in ACCEPT:                 # 실전은 정한 전략만 (FL·BF_PAPER 모의 신호는 무시)
         return
     age = (now_utc() - ts(s["t_detect"])).total_seconds()
     if age > SIGNAL_MAX_AGE_SEC:

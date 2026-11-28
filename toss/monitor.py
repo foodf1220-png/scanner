@@ -137,6 +137,12 @@ def round_tick(x, up):
     return round(k * t, 4)
 
 
+def round_near(x):
+    """가장 가까운 호가 단위 (백테스트 fl_core.round_near 와 같음). 내림하면 $2 짜리 +5% 익절이 +4.6% 가 됨"""
+    t = tick(x)
+    return round(round(x / t) * t, 4)
+
+
 def fmt_px(p):
     return f"{p:.2f}" if p >= 1 else f"{p:.4f}"
 
@@ -156,7 +162,10 @@ def exit_levels(E, L):
         sl_raw, tp_raw = E - D / STOP_DIV + fee, E + D * TARGET_MULT + fee
         if sl_raw >= E:                                    # 손절폭이 수수료보다 좁으면 당기지 않음
             sl_raw = E - D / STOP_DIV
-    SL, TP = round_tick(sl_raw, True), round_tick(tp_raw, False)
+    if EXIT_MODE == "pct":                                 # 고정 % : 가장 가까운 호가 (설정한 % 에 최대한 가깝게)
+        SL, TP = round_near(sl_raw), round_near(tp_raw)
+    else:
+        SL, TP = round_tick(sl_raw, True), round_tick(tp_raw, False)
     return (SL, TP) if SL < E < TP else None
 
 

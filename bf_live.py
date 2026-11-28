@@ -2,13 +2,16 @@
 """
 bf_live.py - Bull Flag V2 실시간 신호 (서버 bf-live.service, 평일 뉴욕 09:20 시작 ~ 장 마감 10분 전 종료)
 
-[조건] V2 + 진입가 $2 이상 + 익절 +5% / 손절 -3% (사용자 지정, bf_config.json)
+[조건] V2 + 진입가 entry_min_price~entry_max_price + 익절 tp_pct / 손절 sl_pct (bf_config.json, 실제 주문 % 는 서버 bot.env)
   검색기 (2분마다 전 종목): 장중 고가 >= 전일 종가 +10%, $0.5~20, 유통주식수 2,000만 주 미만, RVOL 3배(14거래일 같은 시각)
   1분 완성봉 상태 기계 (bf_core.detect): 깃대 5봉 +5% -> 눌림 1~4봉(되돌림 50%·VWAP 위·눌림 거래량 <= 깃대 60%) -> READY
   돌파 (5초마다): 현재가 > 매수 기준가 (직전 조정 음봉 고가), 기준가 +0.5% 이내, 현재가 > 9EMA > VWAP,
-                진입가 $1~2, 뉴욕 09:31~15:30, 깃대마다 첫 돌파 1번
-  -> state/fl_signal_queue.jsonl 에 strategy=BF 로 기록 -> 토스 자동매수 봇(bot.py)이 자동 승인(3종목·30%·현금 10%)
-  -> monitor.py 가 즉시 시장가 매수, 손절 -4% / 익절 +4% 조건주문, 장 마감 10분 전 청산
+                신규 매수 시간 안, 깃대마다 첫 돌파 1번
+  -> state/fl_signal_queue.jsonl 에 strategy=BF 로 기록 -> 토스 자동매수 봇(bot.py)이 자동 승인
+  -> monitor.py 가 즉시 시장가 매수, 손절·익절 조건주문, 60분 지나면·전량 청산 시각에 청산
+[모의] paper_price_ranges (예 $10~20) 돌파는 strategy=BF_PAPER 로만 기록 (bot.py 가 받지 않음 = 주문 없음).
+       장 끝나면 그날 모의 신호를 백테스트와 같은 방식(bf_core.sim_signal)으로 채점 -> state/bf_paper_results.jsonl,
+       요약은 strategy=BF_PAPER_RESULT 로 신호 파일에 남겨 bot.py 가 텔레그램으로 보냄
 [실행] python bf_live.py          실시간 (서비스)
        python bf_live.py --check  최근 장으로 한 번 검색만 (신호 안 씀)
 """
@@ -27,8 +30,23 @@ import fl_core as FC
 from fl_core import KST_S, MIN, clk, day_windows, iso, now_et, regular_1m, round_near
 
 QUEUE = os.path.join(FC.STATE_DIR, "fl_signal_queue.jsonl")
+PAPER_FILE = os.path.join(FC.STATE_DIR, "bf_paper_results.jsonl")
 FLOAT_FILE = os.path.join(FC.HERE, "cache", "bf_float.json")
 SCAN_SEC, HOT_SEC = 120, 5
+
+
+def paper_outcome(bars, s, cfg, W):
+    """모의 신호 하나를 백테스트와 같은 규칙으로 채점 (신호 봉 종가 -> 다음 봉부터 고가·저가, 60분·전량 청산 시각, 비용 반영)"""
+    if bars is None or bars.empty:
+        return None
+    t = pd.Timestamp(s["t"]).tz_convert(bars.index.tz)
+    j = int(bars.index.searchsorted(t))
+    if j >= len(bars) or bars.index[j] != t:
+        return None
+    rec = dict(tk=s["tk"], day=str(W["open"].date()), t=s["t"], j=j, entry_raw=float(s["px"]), trigger=float(s["trigger"]))
+    r = BC.sim_signal(bars, rec, cfg, W, cfg["tp_pct"], cfg["sl_pct"], max_hold=cfg["max_hold_min"])
+    return dict(day=rec["day"], tk=s["tk"], t=s["t"], px=float(s["px"]), why=r["why"], net_pct=round(r["net_pct"], 2),
+                mfe_pct=round(r["mfe_pct"], 2), hold_min=round(r["hold_min"]), exit_t=r["exit_t"])
 
 
 def _pb():
@@ -40,6 +58,7 @@ class BFLive:
     def __init__(self, cfg, check=False):
         self.c, self.check = cfg, check
         self.lo, self.hi = float(cfg["entry_min_price"]), float(cfg["entry_max_price"])   # 진입가 범위 (bf_config.json)
+        self.paper = [(float(a), float(b)) for a, b in (cfg.get("paper_price_ranges") or [])]   # 모의만 (주문 없음)
         self.cands, self.ready, self.fired, self.uni = {}, {}, set(), {}
         self.floats = json.load(open(FLOAT_FILE, encoding="utf-8")) if os.path.exists(FLOAT_FILE) else {}
         self.logf = None
@@ -144,7 +163,8 @@ class BFLive:
                 continue
             if not P["pb_vol"] <= cfg["pb_vol_ratio"] * P["pole_vol"]:     # V2 눌림 거래량
                 continue
-            if not (self.lo * 0.99 <= P["trigger"] < self.hi):
+            trig = P["trigger"]
+            if not (self.lo * 0.99 <= trig < self.hi or any(a * 0.99 <= trig < b for a, b in self.paper)):
                 continue
             ready[tk] = dict(P, key=key, ema=float(F["ema"].iat[-1]), vwap=float(F["vwap"].iat[-1]),
                              chg=float(F["chg"].iat[-1]), rvol=float(F["rvol"].iat[-1]) if F["rvol"].iat[-1] == F["rvol"].iat[-1] else None,
@@ -170,19 +190,20 @@ class BFLive:
             self.fired.add(R["key"])
             self.ready.pop(tk)
             why = None
+            paper = not (self.lo <= p < self.hi) and any(a <= p < b for a, b in self.paper)
             if p > T * (1 + cfg["max_chase_pct"] / 100):
                 why = f"기준가 +{cfg['max_chase_pct']:g}% 초과 (${p:.4g} / 기준가 ${T:.4g}) - 추격 안 함"
-            elif not (self.lo <= p < self.hi):
+            elif not (self.lo <= p < self.hi) and not paper:
                 why = f"진입가 ${p:.4g} 가 ${self.lo:g}~{self.hi:g} 밖"
             elif not (p > R["ema"] > R["vwap"]):
                 why = f"현재가 > 9EMA > VWAP 아님 (현재가 {p:.4g}, EMA {R['ema']:.4g}, VWAP {R['vwap']:.4g})"
             if why:
                 self.log(f"{tk} 돌파 탈락: {why}")
                 continue
-            self.emit(tk, R, p, now)
+            self.emit(tk, R, p, now, paper=paper)
 
-    def emit(self, tk, R, p, now):
-        rec = dict(strategy="BF", tk=tk, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
+    def emit(self, tk, R, p, now, paper=False):
+        rec = dict(strategy="BF_PAPER" if paper else "BF", tk=tk, name=(self.cands.get(tk) or {}).get("name", ""), mode="BF",
                    t=iso(now.floor("min")), t_sig=iso(now), t_detect=iso(now), px=round(p, 6), L=float(R["pb_low"]),
                    SL=round_near(p * (1 - self.c["sl_pct"] / 100)), TP=round_near(p * (1 + self.c["tp_pct"] / 100)),
                    sl_pct=self.c["sl_pct"], tp_pct=self.c["tp_pct"], chg=round(R["chg"], 2),
@@ -190,8 +211,8 @@ class BFLive:
                    trigger=float(R["trigger"]), pole_start=float(R["start"]), pole_high=float(R["high"]),
                    pole_pct=round((R["high"] / R["start"] - 1) * 100, 2), retr=round(float(R["retr"]), 1),
                    pb_bars=len(R["pb"]))
-        self.log(f"🚩 {tk} Bull Flag 돌파 신호 ${p:.4g} (기준가 ${R['trigger']:.4g}, 깃대 +{rec['pole_pct']:.1f}%, "
-                 f"되돌림 {rec['retr']:.0f}%, 눌림 {rec['pb_bars']}봉)")
+        self.log(f"{'📝 [모의 · 주문 없음] ' if paper else '🚩 '}{tk} Bull Flag 돌파 신호 ${p:.4g} (기준가 ${R['trigger']:.4g}, "
+                 f"깃대 +{rec['pole_pct']:.1f}%, 되돌림 {rec['retr']:.0f}%, 눌림 {rec['pb_bars']}봉)")
         if self.check:
             return
         os.makedirs(os.path.dirname(QUEUE), exist_ok=True)
@@ -222,6 +243,13 @@ class BFLive:
             now = now_et()
             if now >= W["flat"]:
                 self.log(f"전량 청산 시각 {clk(W['flat'])} - 신호 종료 (청산은 monitor.py)")
+                if self.paper:
+                    time.sleep(75)                                 # 청산 시각 1분봉까지 받은 뒤 채점
+                    try:
+                        self.paper_review(W)
+                    except Exception as e:
+                        self.log(f"모의 채점 오류: {type(e).__name__}: {e}")
+                        traceback.print_exc()
                 break
             bar = (now - pd.Timedelta(seconds=5)).floor("min")
             steps = []                                             # 검색·1분 갱신·돌파 확인을 따로: 하나가 실패해도 나머지는 돎
@@ -239,6 +267,60 @@ class BFLive:
                     self.log(f"{name} 오류 (다음 주기에 다시): {type(e).__name__}: {e}")
                     traceback.print_exc()
             time.sleep(max(1.0, HOT_SEC - (now_et() - now).total_seconds()))
+
+    def paper_review(self, W):
+        """오늘 모의(BF_PAPER) 신호 채점 -> state/bf_paper_results.jsonl + 텔레그램 요약(BF_PAPER_RESULT, bot.py 가 보냄)"""
+        d = str(W["open"].date())
+        sigs = []
+        if os.path.exists(QUEUE):
+            for line in open(QUEUE, encoding="utf-8"):
+                try:
+                    s = json.loads(line)
+                except Exception:
+                    continue
+                if s.get("strategy") == "BF_PAPER" and str(s.get("t", ""))[:10] == d:
+                    sigs.append(s)
+        rows = []
+        if sigs:
+            data = _pb().download(sorted({s["tk"] for s in sigs}), period="1d", interval="1m", prepost=False)
+            for s in sigs:
+                r = paper_outcome(regular_1m(data.get(s["tk"]), W), s, self.c, W)
+                if r:
+                    rows.append(r)
+                else:
+                    self.log(f"모의 채점 불가 (1분봉 없음): {s['tk']} {s['t']}")
+        hist = {}
+        if os.path.exists(PAPER_FILE):
+            for line in open(PAPER_FILE, encoding="utf-8"):
+                try:
+                    x = json.loads(line)
+                    hist[(x["day"], x["tk"], x["t"])] = x
+                except Exception:
+                    continue
+        new = [r for r in rows if (r["day"], r["tk"], r["t"]) not in hist]
+        if new:
+            os.makedirs(os.path.dirname(PAPER_FILE), exist_ok=True)
+            with open(PAPER_FILE, "a", encoding="utf-8") as f:
+                for r in new:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for r in rows:
+            hist[(r["day"], r["tk"], r["t"])] = r
+        rng = ", ".join(f"${a:g}~{b:g}" for a, b in self.paper)
+        k = lambda xs: (f"승률 {sum(x['net_pct'] > 0 for x in xs) / len(xs) * 100:.0f}% · "
+                        f"평균 {sum(x['net_pct'] for x in xs) / len(xs):+.2f}%") if xs else "-"
+        lines = [f"📝 <b>{rng} 모의 결과</b> (실제 주문 없음) · {d}",
+                 f"오늘 {len(rows)}건" + (f": {k(rows)}" if rows else " - 신호 없음")]
+        for r in rows:
+            lines.append(f"· {pd.Timestamp(r['t']).tz_convert(FC.ET_S):%H:%M} {r['tk']} ${r['px']:.2f} → {r['why']} "
+                         f"{r['net_pct']:+.1f}% ({r['hold_min']}분, 최대 +{r['mfe_pct']:.1f}%)")
+        allr = list(hist.values())
+        lines.append(f"누적 {len(allr)}건 ({len({x['day'] for x in allr})}일): {k(allr)} (비용 반영, 백테스트와 같은 채점)")
+        text = "\n".join(lines)
+        self.log(text.replace("<b>", "").replace("</b>", ""))
+        now = now_et()
+        with open(QUEUE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(strategy="BF_PAPER_RESULT", tk="-", day=d, t=iso(now), t_detect=iso(now), text=text),
+                               ensure_ascii=False) + "\n")
 
     def check_once(self):
         """최근 장(장 전이면 어제 장)으로 검색·상태 기계 한 번 - 신호 파일에는 안 씀"""
